@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-antivirus"
+version = "0.1.0"
+description = "JICloud AI Antiva model and host security guard"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
+
+[project.scripts]
+ai-model-scan = "ai_antivirus.cli:main"
+ai-model-guard = "ai_antivirus.agent_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

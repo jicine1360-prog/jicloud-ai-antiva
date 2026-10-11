@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="antiva_navy">#091526</color>
+    <color name="antiva_blue">#1667C7</color>
+    <color name="antiva_cyan">#72E4FF</color>
+    <color name="antiva_ice">#EAF7FF</color>
+    <color name="antiva_text">#102337</color>
+    <color name="antiva_muted">#60758A</color>
+</resources>

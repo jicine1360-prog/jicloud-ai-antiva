@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Antiva" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/antiva_blue</item>
+        <item name="android:navigationBarColor">@color/antiva_navy</item>
+        <item name="android:statusBarColor">@color/antiva_navy</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  assemble:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: antiva-linux
+          path: dist/linux
+
+      - name: Download windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: antiva-windows
+          path: dist/windows
+
+      - name: Download android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: antiva-android
+          path: dist/android
+
+      - name: Generate combined checksums and manifest
+        run: |
+          version="${{ github.ref_name }}"
+          version="${version#v}"
+          find dist -type f | sort
+          find dist -type f ! -name SHA-256SUMS -print0 | sort -z | xargs -0 sha256sum > dist/SHA256SUMS
+          python3 scripts/make-manifest.py dist "$version"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/SHA256SUMS
+            dist/release-manifest.json
+            dist/*/*

@@ -1,0 +1,17 @@
+{
+  "name": "JICloud AI Antiva",
+  "short_name": "AI Antiva",
+  "description": "JICloud AI model and host security guard",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#091526",
+  "background_color": "#091526",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

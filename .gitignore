@@ -1,0 +1,12 @@
+__pycache__/
+.pytest_cache/
+build/
+dist/linux/
+dist/windows/
+dist/android/
+dist/release-manifest.json
+dist/SHA256SUMS
+reports/
+android/.gradle/
+android/app/build/
+android/local.properties

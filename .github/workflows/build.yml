@@ -1,0 +1,74 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+          - platform: windows
+            os: windows-latest
+          - platform: android
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python (linux/windows)
+        if: matrix.platform != 'android'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup JDK (android)
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        if: matrix.platform == 'android'
+        uses: android-actions/setup-android@v3
+
+      - name: Build Linux executables
+        if: matrix.platform == 'linux'
+        run: ./scripts/build-linux.sh
+
+      - name: Build Windows executables
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -OutputDirectory dist/windows -PythonCommand python -PythonVersion ""
+
+      - name: Build Android debug APK
+        if: matrix.platform == 'android'
+        working-directory: android
+        run: ./gradlew :app:assembleDebug
+
+      - name: Stage Android APK
+        if: matrix.platform == 'android'
+        run: |
+          mkdir -p dist/android
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/android/jicloud-ai-antiva-debug.apk
+
+      - name: Generate checksums
+        run: ./scripts/make-checksums.sh dist/${{ matrix.platform }}
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: antiva-${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}
+          if-no-files-found: error
