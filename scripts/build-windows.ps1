@@ -12,27 +12,36 @@ $BuildDirectory = Join-Path $ProjectRoot "build/windows"
 $SpecDirectory = Join-Path $BuildDirectory "spec"
 $OutputPath = Join-Path $ProjectRoot $OutputDirectory
 
-$PythonInvocation = @($PythonCommand)
-if ($PythonVersion) {
-    $PythonInvocation += "-$PythonVersion"
-}
-$RunPython = {
-    param([string[]]$Args)
-    & $PythonInvocation @Args
-    if ($LASTEXITCODE -ne 0) { throw "python exited with code $LASTEXITCODE" }
+Set-Location $ProjectRoot
+
+function Invoke-PythonModule {
+    param([string]$Module, [string[]]$ModuleArgs)
+    if ($PythonVersion) {
+        & $PythonCommand -$PythonVersion -m $Module @ModuleArgs
+    } else {
+        & $PythonCommand -m $Module @ModuleArgs
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "python -m $Module exited with code $LASTEXITCODE"
+    }
 }
 
-Set-Location $ProjectRoot
-& $RunPython @("-m", "pip", "install", "--quiet", ".[build]")
-if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+Write-Host "Installing build dependencies with $PythonCommand..."
+Invoke-PythonModule pip @("install", "--quiet", ".[build]")
 
 foreach ($Tool in @("ai-model-scan", "ai-model-guard")) {
     $EntryPoint = Join-Path $ProjectRoot "scripts/entrypoints/$($Tool -replace '-', '_').py"
-    & $RunPython @(
-        "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--name", $Tool,
+    Write-Host "Building $Tool..."
+    Invoke-PythonModule PyInstaller @(
+        "--noconfirm", "--clean", "--onefile", "--name", $Tool,
         "--paths", "src", "--distpath", $OutputPath,
         "--workpath", $BuildDirectory, "--specpath", $SpecDirectory, $EntryPoint
     )
+    Write-Host "Built $Tool"
+}
+
+if (-not (Test-Path (Join-Path $OutputPath "ai-model-scan.exe"))) {
+    throw "ai-model-scan.exe was not created in $OutputPath"
 }
 
 Write-Host "Windows executables built in $OutputPath"
