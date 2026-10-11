@@ -27,12 +27,15 @@ an immutable or externally tamper-proof audit trail.
 
 ## Platform Status
 
-| Platform | Current capability | Not yet provided |
-| --- | --- | --- |
-| Linux | Static scanning, directory watch/quarantine, local API, AI-process and IPv4 TCP observation | Traffic blocking, IPv6/UDP/DNS observation, service installer, signed release |
-| Windows | Shared scanner/watch source, EXE build scripts, login-start installer scripts | Built/test EXE, native runtime observation, traffic enforcement, signed installer |
-| Android | Selected-file SHA-256 and extension warning prototype | Scanner-equivalent validation, server connection, alerts, VPN, release APK |
-| macOS | Not started | All product functions |
+| Platform | Distribution | Current capability | Not yet provided |
+| --- | --- | --- | --- |
+| Linux (x64) | `dist/linux/` zipapp (CI-built) | Static scanning, directory watch/quarantine, local API, AI-process and IPv4 TCP observation | Traffic blocking, IPv6/UDP/DNS observation, service installer, signed release |
+| Windows (x64) | `dist/windows/` EXE (CI-built, unsigned) | Shared scanner/watch source, EXE build scripts, login-start installer scripts | Built/test EXE validated on hardware, native runtime observation, traffic enforcement, signed installer |
+| Android | `dist/android/` debug APK (CI-built) | Selected-file SHA-256 and extension warning prototype | Scanner-equivalent validation, server connection, alerts, VPN, release APK |
+| macOS | Not started (postponed) | — | Static scanner, all product functions |
+| iOS | Not started (postponed) | — | All product functions |
+
+Each build only works for its named platform; consume the artifact under the matching `dist/<platform>/` directory and verify it with that directory's `SHA-256SUMS`.
 
 ## Release Gates
 
