@@ -52,6 +52,44 @@ def _tcp_connections(lines: Iterator[str]) -> dict[str, TcpConnection]:
     return connections
 
 
+def _read_binary(path: Path) -> str:
+    try:
+        return path.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _read_link(path: Path) -> str:
+    try:
+        return os.readlink(path)
+    except OSError:
+        return ""
+
+
+def _matched_process_name(comm: str, cmdline: str, exe: str, names: tuple[str, ...]) -> str | None:
+    """Return the configured process name for one process, or None.
+
+    ``/proc/<pid>/comm`` is truncated to 15 characters by the kernel, so long
+    names such as ``text-generation-launcher`` never match on their own, and
+    runtimes launched through an interpreter (``python3 -m vllm...``) report
+    ``python3`` there.  The command line and executable path close both gaps.
+    """
+
+    comm_name = comm.lower()
+    for name in names:
+        if comm_name == name or (len(name) > 15 and comm_name == name[:15]):
+            return name
+    arguments = [argument for argument in cmdline.split("\0") if argument]
+    if not arguments and exe:
+        arguments = [exe]
+    for argument in arguments:
+        base = Path(argument.replace("\\", "/")).name.lower()
+        for name in names:
+            if base == name or base.startswith(f"{name}."):
+                return name
+    return None
+
+
 def _selected_processes(proc_root: Path, process_names: tuple[str, ...]) -> dict[int, str]:
     selected: dict[int, str] = {}
     names = tuple(name.lower() for name in process_names)
@@ -63,11 +101,17 @@ def _selected_processes(proc_root: Path, process_names: tuple[str, ...]) -> dict
         if not entry.name.isdigit():
             continue
         try:
-            name = (entry / "comm").read_text(encoding="utf-8").strip()
+            comm = (entry / "comm").read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        if name.lower() in names:
-            selected[int(entry.name)] = name
+        matched = _matched_process_name(
+            comm,
+            _read_binary(entry / "cmdline"),
+            _read_link(entry / "exe"),
+            names,
+        )
+        if matched:
+            selected[int(entry.name)] = matched
     return selected
 
 
@@ -117,6 +161,10 @@ class LinuxRuntimeMonitor:
             self.last_error = str(error)
 
     def poll_once(self) -> None:
+        # Count the attempt, not only the completed path: a missing or
+        # unreadable /proc/net/tcp must still show up in the poll counter so
+        # the reported health status cannot look healthy while idle.
+        self.polls += 1
         processes = _selected_processes(self.proc_root, self.process_names)
         current_pids = {(pid, name) for pid, name in processes.items()}
         for pid, name in current_pids - self._known_pids:
@@ -126,7 +174,8 @@ class LinuxRuntimeMonitor:
         try:
             with (self.proc_root / "net" / "tcp").open(encoding="utf-8") as stream:
                 connections = _tcp_connections(iter(stream))
-        except OSError:
+        except OSError as error:
+            self.last_error = f"cannot read {self.proc_root / 'net' / 'tcp'}: {error}"
             return
 
         current_connections: set[tuple[int, str, str, int]] = set()
@@ -148,7 +197,6 @@ class LinuxRuntimeMonitor:
                         }
                     )
         self._known_connections = current_connections
-        self.polls += 1
 
     def _run(self) -> None:
         while not self._stop.is_set():
