@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import stat
 import sys
 import zipfile
 
@@ -7,7 +8,11 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from ai_antivirus.cli import main
 from ai_antivirus.intel import ThreatFeed
-from ai_antivirus.scanner import model_files, scan_model
+from ai_antivirus.scanner import (
+    MAX_ARCHIVE_MEMBER_FINDINGS,
+    model_files,
+    scan_model,
+)
 
 
 def test_clean_safetensors_report(tmp_path):
@@ -135,3 +140,95 @@ def test_cli_threat_feed_blocks_file(tmp_path, capsys):
 
     assert main([str(model), "--threat-feed", str(feed_path)]) == 1
     assert "threat_intel_match" in capsys.readouterr().out
+
+
+def test_archive_symlink_member_is_blocked(tmp_path):
+    model = tmp_path / "model.zip"
+    with zipfile.ZipFile(model, "w") as archive:
+        info = zipfile.ZipInfo("weights/link")
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "/etc/passwd")
+
+    report = scan_model(model)
+
+    assert report["status"] == "blocked"
+    assert any(item["code"] == "archive_symlink" for item in report["findings"])
+
+
+def test_archive_executable_payload_is_blocked(tmp_path):
+    model = tmp_path / "model.zip"
+    with zipfile.ZipFile(model, "w") as archive:
+        archive.writestr("weights.so", b"\x7fELF fake native payload")
+
+    report = scan_model(model)
+
+    assert report["status"] == "blocked"
+    assert any(item["code"] == "archive_executable_payload" for item in report["findings"])
+
+
+def test_decompression_bomb_is_blocked(tmp_path):
+    model = tmp_path / "model.zip"
+    chunk = b"\0" * (1024 * 1024)
+    with zipfile.ZipFile(model, "w", zipfile.ZIP_DEFLATED) as archive:
+        with archive.open("huge.bin", "w", force_zip64=True) as stream:
+            for _ in range(101):
+                stream.write(chunk)
+
+    report = scan_model(model)
+
+    assert report["status"] == "blocked"
+    assert any(item["code"] == "archive_bomb" for item in report["findings"])
+    assert model.stat().st_size < 1024 * 1024
+
+
+def test_high_ratio_but_small_archive_is_not_flagged_as_a_bomb(tmp_path):
+    model = tmp_path / "model.zip"
+    payload = bytes(range(256)) * 4096
+    with zipfile.ZipFile(model, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("model.safetensors", payload)
+
+    report = scan_model(model)
+
+    assert "archive_bomb" not in [item["code"] for item in report["findings"]]
+
+
+def test_archive_member_count_is_bounded(tmp_path, monkeypatch):
+    from ai_antivirus import scanner
+
+    monkeypatch.setattr(scanner, "MAX_ARCHIVE_MEMBERS", 100)
+    model = tmp_path / "model.zip"
+    with zipfile.ZipFile(model, "w") as archive:
+        for index in range(105):
+            archive.writestr(f"shard-{index}.bin", b"x")
+
+    report = scan_model(model)
+
+    assert "archive_too_many_members" in [item["code"] for item in report["findings"]]
+    assert len(report["findings"]) <= MAX_ARCHIVE_MEMBER_FINDINGS + 2
+
+
+def test_archive_special_file_member_is_blocked(tmp_path):
+    model = tmp_path / "model.zip"
+    with zipfile.ZipFile(model, "w") as archive:
+        info = zipfile.ZipInfo("weights/fifo")
+        info.external_attr = (stat.S_IFIFO | 0o644) << 16
+        archive.writestr(info, "")
+
+    report = scan_model(model)
+
+    assert report["status"] == "blocked"
+    assert any(item["code"] == "archive_special_file" for item in report["findings"])
+
+
+def test_archive_member_findings_are_capped(tmp_path):
+    model = tmp_path / "model.zip"
+    with zipfile.ZipFile(model, "w") as archive:
+        for index in range(300):
+            archive.writestr(f"../escape-{index}.dat", "not executed")
+
+    report = scan_model(model)
+
+    codes = [item["code"] for item in report["findings"]]
+    assert codes.count("archive_path_traversal") == MAX_ARCHIVE_MEMBER_FINDINGS
+    assert "archive_finding_limit" in codes
+    assert report["status"] == "blocked"

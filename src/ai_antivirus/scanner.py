@@ -28,6 +28,11 @@ SCANNABLE_EXTENSIONS = SUPPORTED_EXTENSIONS | UNSAFE_SERIALIZATION_EXTENSIONS
 SCRIPT_EXTENSIONS = {".bat", ".cmd", ".js", ".ps1", ".py", ".sh"}
 NATIVE_EXTENSIONS = {".dll", ".dylib", ".exe", ".so"}
 MAX_SAFETENSORS_HEADER_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 100_000
+MAX_ARCHIVE_MEMBER_FINDINGS = 50
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024**3
+MIN_ARCHIVE_BOMB_BYTES = 100 * 1024**2
+ARCHIVE_COMPRESSION_RATIO = 100
 
 
 @dataclass(frozen=True)
@@ -108,40 +113,118 @@ def _unsafe_archive_path(member_name: str) -> bool:
     )
 
 
+def _archive_member_findings(member: zipfile.ZipInfo) -> list[Finding]:
+    """Report the per-member risks of one archive entry, without extracting it."""
+
+    findings: list[Finding] = []
+    if _unsafe_archive_path(member.filename):
+        findings.append(
+            Finding(
+                "high",
+                "archive_path_traversal",
+                "Archive member can escape the extraction directory.",
+                member.filename,
+            )
+        )
+
+    suffix = Path(member.filename).suffix.lower()
+    if suffix in SCRIPT_EXTENSIONS or suffix in NATIVE_EXTENSIONS:
+        findings.append(
+            Finding(
+                "high",
+                "archive_executable_payload",
+                "Archive contains a script or native binary; do not extract or load it.",
+                member.filename,
+            )
+        )
+
+    mode = member.external_attr >> 16
+    if stat.S_ISLNK(mode):
+        findings.append(
+            Finding(
+                "high",
+                "archive_symlink",
+                "Archive contains a symbolic link; extraction may escape its target directory.",
+                member.filename,
+            )
+        )
+    elif stat.S_IFMT(mode) in {stat.S_IFCHR, stat.S_IFBLK, stat.S_IFIFO, stat.S_IFSOCK}:
+        findings.append(
+            Finding(
+                "high",
+                "archive_special_file",
+                "Archive declares a device, FIFO, or socket member; extraction can block or corrupt the system.",
+                member.filename,
+            )
+        )
+    return findings
+
+
 def _inspect_archive(path: Path, findings: list[Finding]) -> None:
+    """Inspect archive metadata only, with bounds a hostile archive cannot exceed.
+
+    Nothing is extracted or decompressed: the checks read the central directory.
+    Per-member findings are capped so an archive declaring hundreds of thousands
+    of entries cannot exhaust memory through the report itself.
+    """
+
+    members = 0
+    uncompressed = 0
+    compressed = 0
+    reported = 0
+    suppressed = 0
     with zipfile.ZipFile(path) as archive:
         for member in archive.infolist():
-            if _unsafe_archive_path(member.filename):
-                findings.append(
-                    Finding(
-                        "high",
-                        "archive_path_traversal",
-                        "Archive member can escape the extraction directory.",
-                        member.filename,
-                    )
-                )
+            members += 1
+            uncompressed += member.file_size
+            compressed += member.compress_size
+            if reported >= MAX_ARCHIVE_MEMBER_FINDINGS:
+                suppressed += 1
+                continue
+            member_findings = _archive_member_findings(member)
+            findings.extend(member_findings)
+            reported += len(member_findings)
 
-            suffix = Path(member.filename).suffix.lower()
-            if suffix in SCRIPT_EXTENSIONS or suffix in NATIVE_EXTENSIONS:
-                findings.append(
-                    Finding(
-                        "high",
-                        "archive_executable_payload",
-                        "Archive contains a script or native binary; do not extract or load it.",
-                        member.filename,
-                    )
-                )
-
-            mode = (member.external_attr >> 16) & 0o7777
-            if stat.S_ISLNK(mode):
-                findings.append(
-                    Finding(
-                        "high",
-                        "archive_symlink",
-                        "Archive contains a symbolic link; extraction may escape its target directory.",
-                        member.filename,
-                    )
-                )
+    if suppressed:
+        findings.append(
+            Finding(
+                "medium",
+                "archive_finding_limit",
+                "Archive member findings were truncated at the scanner limit; treat the artifact as untrusted.",
+                f"{suppressed} additional members not reported",
+            )
+        )
+    if members > MAX_ARCHIVE_MEMBERS:
+        findings.append(
+            Finding(
+                "medium",
+                "archive_too_many_members",
+                "Archive declares more members than the scanner inspects in one pass.",
+                f"{members} members",
+            )
+        )
+    if uncompressed > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+        findings.append(
+            Finding(
+                "high",
+                "archive_bomb",
+                "Archive declares more uncompressed data than the scanner accepts.",
+                f"{uncompressed} bytes declared",
+            )
+        )
+    elif (
+        uncompressed >= MIN_ARCHIVE_BOMB_BYTES
+        and compressed
+        and uncompressed / compressed > ARCHIVE_COMPRESSION_RATIO
+    ):
+        findings.append(
+            Finding(
+                "high",
+                "archive_bomb",
+                "Archive compression ratio is consistent with a decompression bomb.",
+                f"{uncompressed} bytes from {compressed} compressed bytes",
+            )
+        )
 
 
 def _inspect_safetensors(path: Path, findings: list[Finding]) -> None:
