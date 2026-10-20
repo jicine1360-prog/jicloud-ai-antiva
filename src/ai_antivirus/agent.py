@@ -143,6 +143,9 @@ class GuardState:
                 "audit_integrity": self.audit.verify(),
                 "audit_degraded": self.audit.degraded,
                 "audit_entries": self.audit.entries,
+                "audit_segments": self.audit.segments,
+                "audit_expired_segments": self.audit.expired_segments,
+                "audit_retention_blocked": self.audit.retention_blocked,
                 "last_decision": self.last_decision,
                 "models_scanned": self.models_scanned,
                 "models_quarantined": self.models_quarantined,
@@ -253,9 +256,18 @@ def serve(
     runtime_process_names: tuple[str, ...] = (),
     threat_feed_path: str | None = None,
     auth_token: str | None = None,
+    audit_max_megabytes: float = 32.0,
+    audit_keep_segments: int = 0,
 ) -> None:
     threat_feed = ThreatFeed(threat_feed_path) if threat_feed_path else None
-    state = GuardState(policy, AuditLog(audit_path))
+    state = GuardState(
+        policy,
+        AuditLog(
+            audit_path,
+            max_bytes=int(audit_max_megabytes * 1024 * 1024) if audit_max_megabytes > 0 else 0,
+            keep_segments=audit_keep_segments if audit_keep_segments > 0 else None,
+        ),
+    )
     if not state.audit.verify(full=True):
         print(
             f"Audit log failed verification: {state.audit.path}. Treat its history as unreliable.",

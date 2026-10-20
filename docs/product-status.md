@@ -58,9 +58,11 @@ Each build only works for its named platform; consume the artifact under the mat
 
 Gate 3 is partially implemented: the local API accepts an optional bearer token
 (`--auth-token` or `AI_ANTIVA_AUTH_TOKEN`) and rejects non-loopback `Host` and
-`Origin` headers, event payloads are size-bounded, and `/v1/status` reports
-truthful component health. Bounded audit retention and externally anchored or
-signed audit checkpoints are still missing.
+`Origin` headers, event payloads are size-bounded, `/v1/status` reports truthful
+component health, and the audit log rotates into size-capped segments with the
+anchors kept so retention cannot silently remove evidence. Externally anchored or
+signed audit checkpoints are still missing, and a rotated segment body is only
+checked at its boundaries, not re-walked.
 
 ## Next Development Phase
 

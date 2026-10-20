@@ -136,11 +136,25 @@ accepted only when it is also loopback, so a page on another site cannot drive
 the API. Rejected requests are counted in `rejections` and recorded in the audit
 log.
 
-`/v1/status` reports `audit_integrity`, `audit_degraded`, and `audit_entries`.
+`/v1/status` reports `audit_integrity`, `audit_degraded`, and `audit_entries`,
+plus `audit_segments`, `audit_expired_segments`, and `audit_retention_blocked`.
 The log is hash-chained and numbered, and `audit.jsonl.anchor` checkpoints its
 tail, so entries removed from the end are reported as degraded instead of
 passing silently. The guard verifies the whole chain when it starts and prints a
 warning to stderr when that check fails.
+
+The live log is capped at `--audit-max-megabytes` (32 MiB by default). Reaching
+the cap renames it to a numbered segment, for example
+`audit.000000000034-000000000039.jsonl`, with its own `.anchor` sidecar, and the
+hash chain and sequence numbers continue in a fresh live file. Nothing is ever
+truncated in place. `--audit-keep-segments` additionally removes the oldest
+segment *bodies*; their anchors are always kept, because the anchor is what
+proves the removed segment's sequence range and boundary hash, and each removal
+is itself recorded as an `audit_segment_expired` entry. A segment whose anchor is
+missing is never removed. Deleting a whole segment, body and anchor together,
+leaves a sequence gap and is reported as degraded. Closed segments are checked at
+their boundaries and are not re-walked, so an edit inside a closed segment needs
+that segment verified directly.
 
 To require a bearer token on the `/v1` routes:
 

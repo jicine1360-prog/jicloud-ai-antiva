@@ -18,6 +18,18 @@ def main(argv: list[str] | None = None) -> int:
         default="~/.local/state/ai-antivirus/audit.jsonl",
         help="append-only audit log path",
     )
+    parser.add_argument(
+        "--audit-max-megabytes",
+        type=float,
+        default=32.0,
+        help="rotate the live audit log into a numbered segment at this size (0 never rotates)",
+    )
+    parser.add_argument(
+        "--audit-keep-segments",
+        type=int,
+        default=0,
+        help="keep only this many rotated segment bodies; anchors are always kept (0 keeps all)",
+    )
     parser.add_argument("--allowed-host", action="append", default=[])
     parser.add_argument("--allowed-path", action="append", default=[])
     parser.add_argument(
@@ -77,6 +89,8 @@ def main(argv: list[str] | None = None) -> int:
             tuple(args.watch_process),
             args.threat_feed,
             auth_token,
+            audit_max_megabytes=args.audit_max_megabytes,
+            audit_keep_segments=args.audit_keep_segments,
         )
     except ValueError as error:
         parser.error(str(error))

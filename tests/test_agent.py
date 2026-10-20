@@ -300,3 +300,81 @@ def test_sigterm_still_writes_the_audit_checkpoint(tmp_path):
     anchor = json.loads((tmp_path / "audit.jsonl.anchor").read_text(encoding="utf-8"))
     assert anchor["seq"] == 1
     assert anchor["entries"] == 1
+
+
+def test_status_reports_audit_rotation(tmp_path):
+    state = GuardState(
+        Policy(),
+        AuditLog(tmp_path / "audit.jsonl", max_bytes=1_500, keep_segments=1),
+    )
+    for index in range(40):
+        state.inspect({"event_type": "model_output", "data": f"response {index}"})
+
+    status = state.status()
+
+    assert status["audit_segments"] >= 2
+    assert status["audit_expired_segments"] >= 1
+    assert status["audit_retention_blocked"] is False
+    assert status["audit_integrity"] is True
+
+
+def test_cli_flags_rotate_and_bound_the_audit_log(tmp_path):
+    import signal
+    import subprocess
+
+    audit = tmp_path / "audit.jsonl"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "ai_antivirus.agent_cli",
+            "--port",
+            "0",
+            "--audit-log",
+            str(audit),
+            "--audit-max-megabytes",
+            "0.002",
+            "--audit-keep-segments",
+            "1",
+        ],
+        cwd=Path(__file__).parents[1],
+        env={**os.environ, "PYTHONPATH": "src"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        listening = process.stdout.readline()
+        port = int(listening.rsplit(":", 1)[1].strip())
+        for index in range(40):
+            request = Request(
+                f"http://127.0.0.1:{port}/v1/events",
+                data=json.dumps({"event_type": "model_output", "text": f"reply {index}"}).encode(
+                    "utf-8"
+                ),
+                headers={"Content-Type": "application/json", "Host": f"127.0.0.1:{port}"},
+                method="POST",
+            )
+            with urlopen(request, timeout=5):
+                pass
+
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        process.stdout.close()
+        process.stderr.close()
+
+    bodies = [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.startswith("audit.")
+        and path.name.endswith(".jsonl")
+        and path.name[6:-6].replace("-", "").isdigit()
+    ]
+    anchors = [path for path in tmp_path.iterdir() if path.name.endswith(".jsonl.anchor")]
+    assert len(bodies) == 1
+    assert len(anchors) >= 3
+    assert not (tmp_path / "audit.jsonl.anchor").read_text(encoding="utf-8") == ""

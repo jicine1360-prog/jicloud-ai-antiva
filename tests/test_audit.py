@@ -228,3 +228,95 @@ def test_anchor_checkpoint_records_the_tail(tmp_path):
     recorded = json.loads(anchor.read_text(encoding="utf-8"))
     assert recorded["seq"] == 3
     assert recorded["entries"] == 3
+
+
+def _segments(audit: AuditLog) -> list[Path]:
+    return sorted(
+        path
+        for path in audit.path.parent.iterdir()
+        if path != audit.path
+        and path.name.startswith(audit.path.stem + ".")
+        and path.name.endswith(audit.path.suffix)
+        and path.name[len(audit.path.stem) + 1 : -len(audit.path.suffix)].replace("-", "").isdigit()
+    )
+
+
+def test_rotation_keeps_the_chain_running(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl", max_bytes=2_000)
+    _append_entries(audit, 40)
+
+    assert audit.segments >= 2
+    assert not audit.degraded
+    assert audit.verify(full=True)
+
+    restarted = AuditLog(tmp_path / "audit.jsonl", max_bytes=2_000)
+    assert not restarted.degraded
+    assert restarted.verify(full=True)
+    assert restarted._last_seq == 40
+
+
+def test_rotation_anchors_every_closed_segment(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl", max_bytes=2_000)
+    _append_entries(audit, 40)
+
+    for segment in _segments(audit):
+        anchor = segment.with_name(segment.name + ".anchor")
+        assert anchor.exists(), segment.name
+        recorded = json.loads(anchor.read_text(encoding="utf-8"))
+        assert recorded["seq"] > 0
+
+
+def test_a_removed_segment_leaves_a_gap(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl", max_bytes=2_000)
+    _append_entries(audit, 40)
+    audit.checkpoint()
+    segments = _segments(audit)
+    assert len(segments) >= 2
+
+    removed = segments[0]
+    removed.unlink()
+    removed.with_name(removed.name + ".anchor").unlink()
+
+    restarted = AuditLog(tmp_path / "audit.jsonl", max_bytes=2_000)
+    assert restarted.degraded
+    assert not restarted.verify()
+
+
+def test_retention_removes_bodies_but_keeps_anchors(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl", max_bytes=2_000, keep_segments=2)
+    _append_entries(audit, 60)
+    audit.checkpoint()
+
+    bodies = _segments(audit)
+    assert len(bodies) == 2
+    assert audit.expired_segments >= 1
+    anchors = [
+        path for path in audit.path.parent.iterdir() if path.name.endswith(".jsonl.anchor")
+    ]
+    assert len(anchors) >= audit.expired_segments + 1
+
+    restarted = AuditLog(tmp_path / "audit.jsonl", max_bytes=2_000, keep_segments=2)
+    assert not restarted.degraded
+    assert restarted.verify(full=True)
+    kinds = [
+        entry["event"].get("kind")
+        for entry in map(json.loads, _lines(audit.path))
+        if isinstance(entry.get("event"), dict)
+    ]
+    assert "audit_segment_expired" in kinds
+
+
+def test_retention_never_deletes_an_unanchored_segment(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl", max_bytes=2_000)
+    _append_entries(audit, 30)
+    audit.checkpoint()
+    segments = _segments(audit)
+    assert len(segments) >= 2
+    for segment in segments:
+        segment.with_name(segment.name + ".anchor").unlink()
+
+    bounded = AuditLog(tmp_path / "audit.jsonl", max_bytes=2_000, keep_segments=1)
+    _append_entries(bounded, 20)
+
+    assert bounded.retention_blocked
+    assert len(_segments(bounded)) == len(segments)
