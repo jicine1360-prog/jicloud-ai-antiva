@@ -10,6 +10,12 @@ headers, inspects ZIP metadata, and emits a machine-readable risk report. A
 `clean` result only means the implemented checks found no signal; it is not a
 malware certification or a guarantee of safe model behavior.
 
+## Documentation
+
+- `docs/usage-ko.md` — 한국어 사용법: 스캔, 가드 서버, HTTP API, 감사 로그 검증·회전·리텐션
+- `docs/design.md` — design rationale and threat model
+- `docs/product-status.md` — platform boundary and release plan
+
 ## Run
 
 ```bash
