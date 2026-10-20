@@ -15,8 +15,10 @@ guarantee that a model cannot leak information.
 2a. Threat feed: a local JSONL/JSON file of blocked SHA-256 indicators with an
    optional reason and source. Feed loading is manual; automatic, signed feed
    updates are a release-gate item below.
-3. A watched directory scans files only after they remain stable for one poll.
-   Blocked artifacts may be atomically moved to a same-filesystem quarantine.
+3. A watched directory scans files only after they remain stable for one poll, and
+   scans a file that keeps changing after twelve deferred polls. Unreadable
+   artifacts are recorded as `scan_failed`. Blocked artifacts may be atomically
+   moved to a same-filesystem quarantine that is owner-only (`0700`).
 4. Linux can observe selected AI server processes and their established external
    IPv4 TCP connections.
 5. Decisions and scan summaries are stored in a local hash-chained audit log.

@@ -185,11 +185,18 @@ never changes host networking.
 - JSON and human-readable reports
 
 The optional watcher scans a new or changed model only after it remains unchanged
-for one polling interval. Artifacts with a `blocked` result can be moved to an
-explicit quarantine directory on the same filesystem. Quarantined files are renamed
-with a hash-derived identifier and have mode `0600`; if quarantine fails, the blocked
-result is still emitted and the failure is recorded instead of being silently discarded.
-This works on Windows and Linux without opening, deserializing, or executing the model.
+for one polling interval. A file that keeps changing is scanned anyway once it has
+been deferred twelve times, and that result carries `artifact_unstable` because it
+may cover a partial write. An artifact that cannot be read is reported once per
+content signature as `scan_failed`, so a coverage gap stays visible in the audit
+log. Artifacts with a `blocked` result can be moved to an explicit quarantine
+directory on the same filesystem. That directory is set to mode `0700` and the
+moved file to `0600` under a hash-derived identifier; if quarantine fails, the
+blocked result is still emitted and the failure is recorded instead of being
+silently discarded. A blocked artifact that has other hard links is reported as
+`quarantine_hardlink_remaining`, because renaming one name cannot remove content
+the remaining links point at. This works on Windows and Linux without opening,
+deserializing, or executing the model.
 On Linux,
 `--watch-runtime` records known AI server processes and their external,
 established IPv4 TCP connections. It is read-only monitoring: policy decisions

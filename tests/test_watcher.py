@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import sys
 import zipfile
@@ -104,3 +105,85 @@ def test_watcher_quarantines_hash_listed_clean_model(tmp_path):
     assert results[0].quarantined_to is not None
     assert results[0].quarantine_error is None
     assert not model.exists()
+
+
+def test_unreadable_artifact_is_reported_once(tmp_path, monkeypatch):
+    model = tmp_path / "model.safetensors"
+    model.write_bytes((2).to_bytes(8, "little") + b"{}")
+    watcher = ModelWatcher((str(tmp_path),), interval_seconds=1)
+
+    def unreadable(path, *args, **kwargs):
+        raise OSError("Permission denied: model.safetensors")
+
+    monkeypatch.setattr("ai_antivirus.watcher.scan_model", unreadable)
+    watcher.poll_once()
+    results = watcher.poll_once()
+
+    assert len(results) == 1
+    report = results[0].report
+    assert report["status"] == "review"
+    assert report["sha256"] is None
+    assert report["size_bytes"] == model.stat().st_size
+    assert [finding["code"] for finding in report["findings"]] == ["scan_failed"]
+    assert watcher.last_error == "Permission denied: model.safetensors"
+    # The scan is retried, but the same content is not audited twice.
+    assert watcher.poll_once() == []
+
+
+def test_a_changing_file_is_scanned_after_the_defer_limit(tmp_path):
+    model = tmp_path / "model.safetensors"
+    watcher = ModelWatcher((str(tmp_path),), interval_seconds=1, max_defer_polls=3)
+
+    # Each poll grows the file, so its signature changes every time.
+    for poll in range(2):
+        model.write_bytes((2).to_bytes(8, "little") + b"{}" + b"x" * (poll + 1))
+        assert watcher.poll_once() == []
+
+    model.write_bytes((2).to_bytes(8, "little") + b"{}" + b"xx" + b"\x09")
+    results = watcher.poll_once()
+
+    assert len(results) == 1
+    report = results[0].report
+    assert [finding["code"] for finding in report["findings"]] == ["artifact_unstable"]
+    assert report["status"] == "review"
+
+
+def test_quarantine_directory_stays_owner_only(tmp_path):
+    model = tmp_path / "unsafe.zip"
+    with zipfile.ZipFile(model, "w") as archive:
+        archive.writestr("../escape.py", "not executed")
+    quarantine = tmp_path.parent / "quarantine"
+    quarantine.mkdir(exist_ok=True)
+    os.chmod(quarantine, 0o755)
+    watcher = ModelWatcher((str(tmp_path),), interval_seconds=1, quarantine_dir=str(quarantine))
+
+    watcher.poll_once()
+    results = watcher.poll_once()
+
+    assert results[0].quarantined_to is not None
+    if sys.platform == "win32":
+        assert quarantine.exists()
+    else:
+        assert quarantine.stat().st_mode & 0o777 == 0o700
+
+
+def test_hardlinked_blocked_artifact_reports_the_remaining_link(tmp_path):
+    if sys.platform == "win32":
+        import pytest
+
+        pytest.skip("hard links are not portable on Windows CI")
+    model = tmp_path / "unsafe.zip"
+    with zipfile.ZipFile(model, "w") as archive:
+        archive.writestr("../escape.py", "not executed")
+    twin = tmp_path.parent / "twin.zip"
+    os.link(model, twin)
+    quarantine = tmp_path.parent / "quarantine"
+    watcher = ModelWatcher((str(tmp_path),), interval_seconds=1, quarantine_dir=str(quarantine))
+
+    watcher.poll_once()
+    results = watcher.poll_once()
+
+    codes = [finding["code"] for finding in results[0].report["findings"]]
+    assert "quarantine_hardlink_remaining" in codes
+    assert not model.exists()
+    assert twin.exists()

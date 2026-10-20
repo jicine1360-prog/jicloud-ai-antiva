@@ -15,6 +15,11 @@ from .intel import ThreatFeed
 
 FileSignature = tuple[int, int, int, int, int]
 
+# A file that changes on every poll used to be deferred forever, which is an
+# easy way to keep an artifact out of the scan.  After this many polls the
+# watcher scans it anyway and labels the result as possibly partial.
+MAX_DEFER_POLLS = 12
+
 
 @dataclass(frozen=True)
 class WatchResult:
@@ -33,9 +38,12 @@ class ModelWatcher:
         quarantine_dir: str | None = None,
         on_result: Callable[[WatchResult], None] | None = None,
         threat_feed: ThreatFeed | None = None,
+        max_defer_polls: int = MAX_DEFER_POLLS,
     ):
         if interval_seconds <= 0:
             raise ValueError("watch interval must be greater than zero")
+        if max_defer_polls < 1:
+            raise ValueError("max_defer_polls must be at least one")
         self.paths = tuple(Path(path).expanduser().resolve(strict=False) for path in paths)
         self.interval_seconds = interval_seconds
         self.quarantine_dir = (
@@ -47,8 +55,11 @@ class ModelWatcher:
             raise ValueError("quarantine directory must not be inside a watched path")
         self.on_result = on_result
         self.threat_feed = threat_feed
+        self.max_defer_polls = max_defer_polls
         self._seen: dict[Path, FileSignature] = {}
         self._scanned: dict[Path, FileSignature] = {}
+        self._failed: dict[Path, FileSignature] = {}
+        self._deferred: dict[Path, int] = {}
         self._stop = Event()
         self._thread: Thread | None = None
         self.last_error: str | None = None
@@ -86,10 +97,25 @@ class ModelWatcher:
     def _quarantine(self, path: Path, report: dict, expected: FileSignature) -> str:
         assert self.quarantine_dir is not None
         self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+        # Blocked artifacts stay readable only to their owner.  mkdir alone is
+        # not enough: an existing directory keeps whatever mode it already had.
+        os.chmod(self.quarantine_dir, 0o700)
         if self._signature(path) != expected:
             raise OSError("model changed while it was being scanned")
         if path.lstat().st_dev != self.quarantine_dir.stat().st_dev:
             raise OSError("quarantine directory must be on the same filesystem as the watched file")
+        links = path.lstat().st_nlink
+        if links > 1:
+            # Renaming one name cannot remove content that other links still
+            # point at, so the leftover exposure becomes part of the evidence.
+            report["findings"].append(
+                {
+                    "severity": "medium",
+                    "code": "quarantine_hardlink_remaining",
+                    "message": "The artifact has other hard links; moving one name does not remove the content.",
+                    "evidence": f"st_nlink={links}",
+                }
+            )
         destination = self.quarantine_dir / f"{path.name}.{report['sha256'][:12]}.{uuid4().hex}.quarantined"
         # A quarantined artifact must not retain an executable mode.  This is
         # defense in depth: the scanner never executes artifacts, but other
@@ -97,6 +123,27 @@ class ModelWatcher:
         os.chmod(path, 0o600, follow_symlinks=False)
         os.replace(path, destination)
         return str(destination)
+
+    def _failure_report(self, path: Path, signature: FileSignature, error: Exception) -> dict:
+        """Describe an artifact that could not be read, so the gap is auditable."""
+
+        suffix = path.suffix.lower().removeprefix(".")
+        return {
+            "schema_version": 1,
+            "path": str(path),
+            "size_bytes": signature[4],
+            "sha256": None,
+            "detected_format": suffix or "unknown",
+            "status": "review",
+            "findings": [
+                {
+                    "severity": "medium",
+                    "code": "scan_failed",
+                    "message": "The artifact could not be read completely, so it was not assessed.",
+                    "evidence": str(error),
+                }
+            ],
+        }
 
     def poll_once(self) -> list[WatchResult]:
         """Scan files unchanged since the preceding poll, returning new results."""
@@ -109,10 +156,33 @@ class ModelWatcher:
             except (OSError, ValueError):
                 continue
             current[path] = signature
-            if self._seen.get(path) != signature or self._scanned.get(path) == signature:
+            if self._scanned.get(path) == signature:
                 continue
+            stable = self._seen.get(path) == signature
+            if stable:
+                self._deferred.pop(path, None)
+                deferrals = 0
+            else:
+                deferrals = self._deferred.get(path, 0) + 1
+                self._deferred[path] = deferrals
+                if deferrals < self.max_defer_polls:
+                    continue
             try:
                 report = scan_model(path, self.threat_feed)
+                if not stable:
+                    report["findings"].append(
+                        {
+                            "severity": "medium",
+                            "code": "artifact_unstable",
+                            "message": (
+                                "The file kept changing across polls; it was scanned anyway and the "
+                                "result may cover a partial write."
+                            ),
+                            "evidence": f"deferred {deferrals} polls",
+                        }
+                    )
+                    if report["status"] == "clean":
+                        report["status"] = "review"
                 quarantined_to = None
                 quarantine_error = None
                 if report["status"] == "blocked" and self.quarantine_dir:
@@ -133,12 +203,27 @@ class ModelWatcher:
                 if self.on_result:
                     self.on_result(result)
                 self._scanned[path] = signature
+                self._deferred.pop(path, None)
             except (OSError, ValueError) as error:
+                # A file that cannot be read is a gap in coverage, not a silent
+                # skip: report it once per content signature and keep retrying.
                 self.last_error = str(error)
+                if self._failed.get(path) != signature:
+                    self._failed[path] = signature
+                    failure = WatchResult(report=self._failure_report(path, signature, error))
+                    results.append(failure)
+                    if self.on_result:
+                        self.on_result(failure)
                 continue
         self._seen = current
         self._scanned = {
             path: signature for path, signature in self._scanned.items() if path in current
+        }
+        self._failed = {
+            path: signature for path, signature in self._failed.items() if path in current
+        }
+        self._deferred = {
+            path: count for path, count in self._deferred.items() if path in current
         }
         return results
 
