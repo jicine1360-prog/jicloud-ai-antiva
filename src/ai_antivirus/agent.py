@@ -84,6 +84,7 @@ class GuardState:
                 "events_seen": self.events_seen,
                 "events_blocked": self.events_blocked,
                 "audit_integrity": self.audit.verify(),
+                "audit_degraded": self.audit.degraded,
                 "last_decision": self.last_decision,
                 "models_scanned": self.models_scanned,
                 "models_quarantined": self.models_quarantined,
