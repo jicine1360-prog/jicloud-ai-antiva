@@ -20,10 +20,13 @@ guarantee that a model cannot leak information.
 4. Linux can observe selected AI server processes and their established external
    IPv4 TCP connections.
 5. Decisions and scan summaries are stored in a local hash-chained audit log.
+   Entries are numbered and a `<log>.anchor` sidecar checkpoints the last entry,
+   so removing the tail of the log is detected when the guard starts again.
 
-The local audit log detects ordinary in-place edits. It is not independent proof
-against a privileged attacker, deletion, or a complete rewrite. Do not call it
-an immutable or externally tamper-proof audit trail.
+The local audit log detects ordinary in-place edits and removed tail entries.
+It is not independent proof against a privileged attacker, deletion of both the
+log and its anchor, or a complete rewrite. Do not call it an immutable or
+externally tamper-proof audit trail.
 
 ## Platform Status
 

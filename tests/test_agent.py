@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import sys
 from threading import Thread
@@ -260,3 +261,42 @@ def test_status_reports_enforcement_mode_and_component_health(tmp_path):
     assert status["threat_feed"] == "disabled"
     assert status["auth"] == "disabled"
     assert status["rejections"] == 0
+
+
+def test_sigterm_still_writes_the_audit_checkpoint(tmp_path):
+    import signal
+    import subprocess
+
+    audit = tmp_path / "audit.jsonl"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "ai_antivirus.agent_cli", "--port", "0", "--audit-log", str(audit)],
+        cwd=Path(__file__).parents[1],
+        env={**os.environ, "PYTHONPATH": "src"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        listening = process.stdout.readline()
+        port = int(listening.rsplit(":", 1)[1].strip())
+        request = Request(
+            f"http://127.0.0.1:{port}/v1/events",
+            data=json.dumps({"event_type": "model_output", "text": "reply"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Host": f"127.0.0.1:{port}"},
+            method="POST",
+        )
+        with urlopen(request, timeout=5):
+            pass
+
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        process.stdout.close()
+        process.stderr.close()
+
+    anchor = json.loads((tmp_path / "audit.jsonl.anchor").read_text(encoding="utf-8"))
+    assert anchor["seq"] == 1
+    assert anchor["entries"] == 1

@@ -5,6 +5,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
+import signal
 import sys
 from threading import Lock
 from urllib.parse import urlsplit
@@ -19,6 +20,14 @@ from .watcher import ModelWatcher, WatchResult
 MAX_EVENT_BYTES = 1024 * 1024
 MAX_RECORDED_REJECTIONS = 100
 LOCAL_HOST_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+class _ShutdownRequested(Exception):
+    """Raised inside the server loop when a termination signal arrives."""
+
+
+def _stop_gracefully(signum: int, frame: object) -> None:
+    raise _ShutdownRequested()
 
 
 def _host_is_local(host_header: str) -> bool:
@@ -133,6 +142,7 @@ class GuardState:
                 "rejections": self.rejections,
                 "audit_integrity": self.audit.verify(),
                 "audit_degraded": self.audit.degraded,
+                "audit_entries": self.audit.entries,
                 "last_decision": self.last_decision,
                 "models_scanned": self.models_scanned,
                 "models_quarantined": self.models_quarantined,
@@ -246,6 +256,12 @@ def serve(
 ) -> None:
     threat_feed = ThreatFeed(threat_feed_path) if threat_feed_path else None
     state = GuardState(policy, AuditLog(audit_path))
+    if not state.audit.verify(full=True):
+        print(
+            f"Audit log failed verification: {state.audit.path}. Treat its history as unreliable.",
+            file=sys.stderr,
+            flush=True,
+        )
     server = GuardServer(port, state, auth_token)
     watcher = (
         ModelWatcher(
@@ -288,13 +304,27 @@ def serve(
         watcher.start()
     if runtime_monitor:
         runtime_monitor.start()
+    # systemd and `kill` send SIGTERM, whose default action skips the cleanup
+    # below.  Translate it into an orderly shutdown so the audit checkpoint and
+    # the watcher stop still run.
+    previous_handler = None
+    try:
+        previous_handler = signal.signal(signal.SIGTERM, _stop_gracefully)
+    except ValueError:
+        pass  # not the main thread: leave signal handling to the embedder
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, _ShutdownRequested):
         pass
     finally:
+        if previous_handler is not None:
+            try:
+                signal.signal(signal.SIGTERM, previous_handler)
+            except (ValueError, OSError):
+                pass
         if watcher:
             watcher.stop()
         if runtime_monitor:
             runtime_monitor.stop()
         server.server_close()
+        state.audit.checkpoint()

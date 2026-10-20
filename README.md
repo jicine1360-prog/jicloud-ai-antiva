@@ -136,6 +136,12 @@ accepted only when it is also loopback, so a page on another site cannot drive
 the API. Rejected requests are counted in `rejections` and recorded in the audit
 log.
 
+`/v1/status` reports `audit_integrity`, `audit_degraded`, and `audit_entries`.
+The log is hash-chained and numbered, and `audit.jsonl.anchor` checkpoints its
+tail, so entries removed from the end are reported as degraded instead of
+passing silently. The guard verifies the whole chain when it starts and prints a
+warning to stderr when that check fails.
+
 To require a bearer token on the `/v1` routes:
 
 ```bash
