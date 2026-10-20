@@ -150,7 +150,9 @@ def validate_policy(data: Any) -> EgressPolicy:
     if not cgroup.startswith("/") or "\x00" in cgroup:
         raise PolicyValidationError("cgroup must be an absolute path")
     generation = _require_int(data.get("generation", 1), "generation", minimum=1)
-    raw_rules = data.get("allow", [])
+    if "allow" not in data:
+        raise PolicyValidationError("allow is required")
+    raw_rules = data["allow"]
     if not isinstance(raw_rules, list) or len(raw_rules) > 4096:
         raise PolicyValidationError("allow must be a list with at most 4096 rules")
     rules = tuple(_parse_rule(rule) for rule in raw_rules)
@@ -192,6 +194,7 @@ def decide(
     except ValueError:
         return _decision(policy, destination, None, normalized_protocol, family, "invalid_destination")
     inferred_family = "ipv4" if address.version == 4 else "ipv6"
+    family = family.lower() if isinstance(family, str) else family
     if family is not None and family != inferred_family:
         return _decision(policy, destination, None, normalized_protocol, family, "family_mismatch")
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:

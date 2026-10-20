@@ -79,3 +79,25 @@ def test_load_policy_from_json(tmp_path):
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(policy()), encoding="utf-8")
     assert load_policy(path).profile == "lab-model"
+
+
+def test_policy_without_an_allow_key_is_rejected():
+    missing = policy()
+    del missing["allow"]
+
+    with pytest.raises(PolicyValidationError, match="allow is required"):
+        validate_policy(missing)
+
+
+def test_empty_allow_list_is_a_valid_deny_all_policy():
+    empty = policy()
+    empty["allow"] = []
+
+    assert decide(validate_policy(empty), "127.0.0.1", 8080).reason == "default_deny"
+
+
+def test_destination_family_is_case_insensitive():
+    loaded = validate_policy(policy())
+
+    assert decide(loaded, "127.0.0.1", 8080, family="IPv4").action == "allow"
+    assert decide(loaded, "127.0.0.1", 8080, family="IPv6").reason == "family_mismatch"
