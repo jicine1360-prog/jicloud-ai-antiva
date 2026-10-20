@@ -187,3 +187,16 @@ def test_hardlinked_blocked_artifact_reports_the_remaining_link(tmp_path):
     assert "quarantine_hardlink_remaining" in codes
     assert not model.exists()
     assert twin.exists()
+
+
+def test_quarantine_without_a_configured_directory_is_an_error(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"GGUF")
+    watcher = ModelWatcher((str(tmp_path),), interval_seconds=1)
+
+    try:
+        watcher._quarantine(model, {"sha256": "0" * 64}, watcher._signature(model))
+    except OSError as error:
+        assert "not configured" in str(error)
+    else:
+        raise AssertionError("quarantining without a directory must report an error")

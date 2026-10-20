@@ -95,7 +95,10 @@ class ModelWatcher:
         return files
 
     def _quarantine(self, path: Path, report: dict, expected: FileSignature) -> str:
-        assert self.quarantine_dir is not None
+        if self.quarantine_dir is None:
+            # An assert disappears under python -O, and the failure that follows
+            # would be an AttributeError on None instead of a reported error.
+            raise OSError("quarantine directory is not configured")
         self.quarantine_dir.mkdir(parents=True, exist_ok=True)
         # Blocked artifacts stay readable only to their owner.  mkdir alone is
         # not enough: an existing directory keeps whatever mode it already had.
