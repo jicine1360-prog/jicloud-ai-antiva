@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
 import hashlib
@@ -86,11 +87,41 @@ class ScanReport:
         }
 
 
-def _sha256(path: Path) -> str:
+def _open_regular_file(path: Path):
+    """Open a file for reading without following symlinks.
+
+    The watcher checks that a path is a regular file before scanning it, and a
+    directory an untrusted process can write to may swap that entry between the
+    check and the read.  Opening through a descriptor and checking it with fstat
+    closes the window: every later read uses the same inode, and a symlink swap
+    makes the open fail instead of reading someone else's file.  Windows has no
+    O_NOFOLLOW, so there the check is limited to the regular-file test.
+    """
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"scan target must be a regular file: {path}") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"scan target must be a regular file: {path}")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _sha256(stream) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    stream.seek(0)
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -101,8 +132,8 @@ def _format_for(path: Path) -> str:
     return "unknown"
 
 
-def _is_archive(path: Path) -> bool:
-    return zipfile.is_zipfile(path)
+def _is_archive(stream) -> bool:
+    return zipfile.is_zipfile(stream)
 
 
 def _unsafe_archive_path(member_name: str) -> bool:
@@ -122,12 +153,17 @@ def _archive_member_findings(member: zipfile.ZipInfo) -> list[Finding]:
 
     findings: list[Finding] = []
     normalized_member = member.filename.replace("\\", "/")
-    if normalized_member == TORCH_ARCHIVE_PICKLE or normalized_member.endswith(f"/{TORCH_ARCHIVE_PICKLE}"):
+    suffix = Path(member.filename).suffix.lower()
+    if (
+        normalized_member == TORCH_ARCHIVE_PICKLE
+        or normalized_member.endswith(f"/{TORCH_ARCHIVE_PICKLE}")
+        or suffix in UNSAFE_SERIALIZATION_EXTENSIONS
+    ):
         findings.append(
             Finding(
                 "medium",
                 "archive_unsafe_member",
-                "Archive holds a pickle stream (torch checkpoint); loading it can execute arbitrary code.",
+                "Archive holds an object-serialized member; loading it can execute arbitrary code.",
                 member.filename,
             )
         )
@@ -141,7 +177,6 @@ def _archive_member_findings(member: zipfile.ZipInfo) -> list[Finding]:
             )
         )
 
-    suffix = Path(member.filename).suffix.lower()
     if suffix in SCRIPT_EXTENSIONS or suffix in NATIVE_EXTENSIONS:
         findings.append(
             Finding(
@@ -174,7 +209,7 @@ def _archive_member_findings(member: zipfile.ZipInfo) -> list[Finding]:
     return findings
 
 
-def _inspect_archive(path: Path, findings: list[Finding]) -> None:
+def _inspect_archive(stream, findings: list[Finding]) -> None:
     """Inspect archive metadata only, with bounds a hostile archive cannot exceed.
 
     Nothing is extracted or decompressed: the checks read the central directory.
@@ -187,7 +222,8 @@ def _inspect_archive(path: Path, findings: list[Finding]) -> None:
     compressed = 0
     reported = 0
     suppressed = 0
-    with zipfile.ZipFile(path) as archive:
+    stream.seek(0)
+    with zipfile.ZipFile(stream) as archive:
         for member in archive.infolist():
             members += 1
             uncompressed += member.file_size
@@ -241,27 +277,98 @@ def _inspect_archive(path: Path, findings: list[Finding]) -> None:
         )
 
 
-def _inspect_safetensors(path: Path, findings: list[Finding]) -> None:
-    size = path.stat().st_size
-    with path.open("rb") as stream:
-        header_length_data = stream.read(8)
-        if len(header_length_data) != 8:
-            findings.append(Finding("medium", "invalid_safetensors_header", "SafeTensors header is missing."))
-            return
-        header_length = struct.unpack("<Q", header_length_data)[0]
-        if header_length < 2 or header_length > MAX_SAFETENSORS_HEADER_BYTES or header_length > size - 8:
-            findings.append(Finding("medium", "invalid_safetensors_header", "SafeTensors header length is invalid."))
-            return
-        try:
-            header = json.loads(stream.read(header_length))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            findings.append(Finding("medium", "invalid_safetensors_header", "SafeTensors header is not valid JSON."))
-            return
+def _inspect_safetensors(stream, size: int, findings: list[Finding]) -> None:
+    stream.seek(0)
+    header_length_data = stream.read(8)
+    if len(header_length_data) != 8:
+        findings.append(Finding("medium", "invalid_safetensors_header", "SafeTensors header is missing."))
+        return
+    header_length = struct.unpack("<Q", header_length_data)[0]
+    if header_length < 2 or header_length > MAX_SAFETENSORS_HEADER_BYTES or header_length > size - 8:
+        findings.append(Finding("medium", "invalid_safetensors_header", "SafeTensors header length is invalid."))
+        return
+    try:
+        header = json.loads(stream.read(header_length))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        findings.append(Finding("medium", "invalid_safetensors_header", "SafeTensors header is not valid JSON."))
+        return
     if not isinstance(header, dict):
         findings.append(Finding("medium", "invalid_safetensors_header", "SafeTensors header is not an object."))
+        return
+    _inspect_safetensors_ranges(header, header_length, size, findings)
 
 
-def _pickle_protocol(path: Path) -> int | None:
+def _inspect_safetensors_ranges(header: dict, header_length: int, size: int, findings: list[Finding]) -> None:
+    """Check the byte ranges a SafeTensors header declares for its tensors.
+
+    A SafeTensors file is a JSON header followed by one data region, and every
+    tensor declares ``data_offsets`` relative to the end of that header.  A range
+    that runs past the end of the file, overlaps another tensor, or leaves bytes
+    that no tensor claims is either a corrupt artifact or a place to keep content
+    no loader will ever hand to the model.  Only the header is read; the tensor
+    data is never touched.
+    """
+
+    data_length = size - 8 - header_length
+    ranges: list[tuple[int, int]] = []
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        offsets = entry.get("data_offsets") if isinstance(entry, dict) else None
+        if (
+            not isinstance(offsets, list)
+            or len(offsets) != 2
+            or not all(isinstance(value, int) and not isinstance(value, bool) for value in offsets)
+            or offsets[0] < 0
+            or offsets[1] < offsets[0]
+        ):
+            findings.append(
+                Finding(
+                    "medium",
+                    "safetensors_invalid_tensor_range",
+                    "SafeTensors tensor entry declares no usable data_offsets.",
+                    name,
+                )
+            )
+            continue
+        ranges.append((offsets[0], offsets[1]))
+    if not ranges:
+        return
+
+    declared_end = max(end for _, end in ranges)
+    if declared_end > data_length:
+        findings.append(
+            Finding(
+                "medium",
+                "safetensors_offsets_out_of_range",
+                "SafeTensors tensor data extends past the end of the file.",
+                f"declared {declared_end} bytes, file holds {data_length}",
+            )
+        )
+
+    ordered = sorted(ranges)
+    highest = ordered[0][1]
+    for begin, end in ordered[1:]:
+        if begin < highest:
+            findings.append(
+                Finding("medium", "safetensors_overlapping_tensors", "SafeTensors tensors share bytes.")
+            )
+            break
+        highest = max(highest, end)
+
+    trailing = data_length - declared_end
+    if trailing > 0:
+        findings.append(
+            Finding(
+                "low",
+                "safetensors_trailing_data",
+                "File has bytes after the last tensor that no tensor claims.",
+                f"{trailing} bytes",
+            )
+        )
+
+
+def _pickle_protocol(stream) -> int | None:
     """Return the pickle protocol version when the file starts with a framing opcode.
 
     Torch and TensorFlow checkpoints are pickle streams, and loading one runs
@@ -269,11 +376,8 @@ def _pickle_protocol(path: Path) -> int | None:
     file extension alone.
     """
 
-    try:
-        with path.open("rb") as stream:
-            head = stream.read(2)
-    except OSError:
-        return None
+    stream.seek(0)
+    head = stream.read(2)
     if head[:1] != b"\x80":
         return None
     version = head[1]
@@ -295,15 +399,15 @@ def _read_varint(data: bytes, cursor: int) -> tuple[int | None, int]:
     return None, cursor
 
 
-def _inspect_onnx(path: Path, findings: list[Finding]) -> None:
+def _inspect_onnx(stream, findings: list[Finding]) -> None:
     """Check the leading ModelProto fields without a protobuf dependency.
 
     Only the preamble is validated: field 1 must be a varint ``ir_version``
     followed by a plausible field tag.  Graph contents are not interpreted.
     """
 
-    with path.open("rb") as stream:
-        head = stream.read(64)
+    stream.seek(0)
+    head = stream.read(64)
     if not head or head[0] != ONNX_IR_VERSION_TAG:
         findings.append(
             Finding(
@@ -325,15 +429,15 @@ def _inspect_onnx(path: Path, findings: list[Finding]) -> None:
         )
 
 
-def _inspect_known_format(path: Path, suffix: str, findings: list[Finding]) -> None:
+def _inspect_known_format(stream, suffix: str, size: int, findings: list[Finding]) -> None:
     if suffix == ".safetensors":
-        _inspect_safetensors(path, findings)
+        _inspect_safetensors(stream, size, findings)
         return
     if suffix == ".onnx":
-        _inspect_onnx(path, findings)
+        _inspect_onnx(stream, findings)
         return
-    with path.open("rb") as stream:
-        prefix = stream.read(8)
+    stream.seek(0)
+    prefix = stream.read(8)
     if suffix == ".gguf" and (prefix[:4] != b"GGUF" or len(prefix) != 8):
         findings.append(Finding("medium", "invalid_gguf_header", "GGUF magic or version header is invalid."))
     elif suffix == ".tflite" and prefix[4:8] != b"TFL3":
@@ -346,63 +450,72 @@ def scan_model(path_value: str | Path, threat_feed: ThreatFeed | None = None) ->
     path = Path(path_value).expanduser()
     if not path.exists():
         raise FileNotFoundError(path)
-    if not path.is_file() or path.is_symlink():
-        raise ValueError(f"scan target must be a regular file: {path}")
 
     findings: list[Finding] = []
     suffix = path.suffix.lower()
     detected_format = _format_for(path)
-    is_archive = _is_archive(path)
+    # One descriptor for the whole scan: the regular-file check and every read
+    # below refer to the same inode, so an entry swapped inside a watched
+    # directory cannot redirect the scan to someone else's file.
+    with _open_regular_file(path) as stream:
+        size = os.fstat(stream.fileno()).st_size
+        is_archive = _is_archive(stream)
 
-    if suffix not in SUPPORTED_EXTENSIONS and suffix not in UNSAFE_SERIALIZATION_EXTENSIONS:
-        findings.append(
-            Finding(
-                "low",
-                "unknown_format",
-                "File extension is not in the initial model format allowlist.",
-                suffix or "no extension",
-            )
-        )
-
-    if suffix in UNSAFE_SERIALIZATION_EXTENSIONS and not is_archive:
-        protocol = _pickle_protocol(path)
-        if protocol is None:
+        if suffix not in SUPPORTED_EXTENSIONS and suffix not in UNSAFE_SERIALIZATION_EXTENSIONS:
             findings.append(
                 Finding(
-                    "medium",
-                    "unsafe_serialization_format",
-                    "Format may require deserialization; use a restricted loader and sandbox.",
-                    suffix,
-                )
-            )
-        else:
-            findings.append(
-                Finding(
-                    "medium",
-                    "pickle_framed_artifact",
-                    "Artifact is a pickle stream; loading it can execute arbitrary code.",
-                    f"pickle protocol {protocol}",
+                    "low",
+                    "unknown_format",
+                    "File extension is not in the initial model format allowlist.",
+                    suffix or "no extension",
                 )
             )
 
-    if suffix == ".zip" and not is_archive:
-        findings.append(Finding("high", "invalid_archive", "File has an invalid ZIP structure."))
-    elif is_archive:
-        detected_format = "zip"
-        if suffix != ".zip":
-            findings.append(
-                Finding("medium", "format_extension_mismatch", "ZIP content does not match the file extension.", suffix)
-            )
-        try:
-            _inspect_archive(path, findings)
-        except zipfile.BadZipFile:
-            findings.append(
-                Finding("high", "invalid_archive", "File has an invalid ZIP structure.")
-            )
-    elif suffix in {".gguf", ".onnx", ".safetensors", ".tflite"}:
-        _inspect_known_format(path, suffix, findings)
+        if suffix in UNSAFE_SERIALIZATION_EXTENSIONS and not is_archive:
+            protocol = _pickle_protocol(stream)
+            if protocol is None:
+                findings.append(
+                    Finding(
+                        "medium",
+                        "unsafe_serialization_format",
+                        "Format may require deserialization; use a restricted loader and sandbox.",
+                        suffix,
+                    )
+                )
+            else:
+                findings.append(
+                    Finding(
+                        "medium",
+                        "pickle_framed_artifact",
+                        "Artifact is a pickle stream; loading it can execute arbitrary code.",
+                        f"pickle protocol {protocol}",
+                    )
+                )
 
-    sha256 = _sha256(path)
+        if suffix == ".zip" and not is_archive:
+            findings.append(Finding("high", "invalid_archive", "File has an invalid ZIP structure."))
+        elif is_archive:
+            detected_format = "zip"
+            if suffix != ".zip":
+                findings.append(
+                    Finding(
+                        "medium",
+                        "format_extension_mismatch",
+                        "ZIP content does not match the file extension.",
+                        suffix,
+                    )
+                )
+            try:
+                _inspect_archive(stream, findings)
+            except zipfile.BadZipFile:
+                findings.append(
+                    Finding("high", "invalid_archive", "File has an invalid ZIP structure.")
+                )
+        elif suffix in {".gguf", ".onnx", ".safetensors", ".tflite"}:
+            _inspect_known_format(stream, suffix, size, findings)
+
+        sha256 = _sha256(stream)
+
     if threat_feed is not None:
         indicator = threat_feed.lookup(sha256)
         if indicator is not None:
@@ -417,7 +530,7 @@ def scan_model(path_value: str | Path, threat_feed: ThreatFeed | None = None) ->
 
     return ScanReport(
         path=str(path),
-        size_bytes=path.stat().st_size,
+        size_bytes=size,
         sha256=sha256,
         detected_format=detected_format,
         findings=findings,

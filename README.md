@@ -182,6 +182,13 @@ never changes host networking.
 - Unsafe serialization warning
 - ZIP archive validity, path traversal, and Windows-path detection
 - Script and native binary detection inside ZIP archives
+- Serialized-object members inside ZIP archives (`.pkl`, `.pt`, `.bin`, and the
+  like) are reported without extracting them
+- Each artifact is read through one file descriptor, and anything that is not a
+  regular file is refused: a symlink, directory, or FIFO is never scanned, and an
+  entry swapped inside a watched directory cannot redirect a scan to someone
+  else's file. Windows has no `O_NOFOLLOW`, so there only the regular-file check
+  applies.
 - JSON and human-readable reports
 
 The optional watcher scans a new or changed model only after it remains unchanged

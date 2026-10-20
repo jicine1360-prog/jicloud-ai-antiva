@@ -1,8 +1,11 @@
 import json
+import os
 from pathlib import Path
 import stat
 import sys
 import zipfile
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -292,3 +295,103 @@ def test_onnx_with_a_bad_preamble_is_flagged(tmp_path):
 
     assert "invalid_onnx_header" in [item["code"] for item in report["findings"]]
     assert report["status"] == "review"
+
+
+def test_symlink_is_refused_before_any_read(tmp_path):
+    real = tmp_path / "real.safetensors"
+    real.write_bytes((2).to_bytes(8, "little") + b"{}")
+    link = tmp_path / "link.safetensors"
+    link.symlink_to(real)
+
+    with pytest.raises(ValueError):
+        scan_model(link)
+
+
+def test_fifo_is_refused_without_blocking(tmp_path):
+    # A FIFO would block an ordinary open() forever; the scanner opens with
+    # O_NONBLOCK and rejects anything that is not a regular file instead.
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo is not available on this platform")
+    fifo = tmp_path / "model.safetensors"
+    os.mkfifo(fifo)
+
+    with pytest.raises(ValueError):
+        scan_model(fifo)
+
+
+def test_directory_is_refused(tmp_path):
+    with pytest.raises(ValueError):
+        scan_model(tmp_path)
+
+
+def test_archive_member_with_a_serialized_extension_is_flagged(tmp_path):
+    archive = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("weights/model.pkl", b"\x80\x04}q\x00.")
+        bundle.writestr("payload.pt", b"\x80\x02\x8a\nl\xfc\x9cF\xf9")
+        bundle.writestr("config.json", "{}")
+
+    report = scan_model(archive)
+
+    unsafe = [item for item in report["findings"] if item["code"] == "archive_unsafe_member"]
+    assert sorted(item["evidence"] for item in unsafe) == ["payload.pt", "weights/model.pkl"]
+    assert report["status"] == "review"
+
+
+def _safetensors_bytes(header: dict, data: bytes) -> bytes:
+    body = json.dumps(header).encode("utf-8")
+    return len(body).to_bytes(8, "little") + body + data
+
+
+def _tensor(offsets):
+    return {"dtype": "F32", "shape": [1], "data_offsets": offsets}
+
+
+def test_safetensors_bytes_nobody_claims_are_reported(tmp_path):
+    model = tmp_path / "padded.safetensors"
+    model.write_bytes(_safetensors_bytes({"a": _tensor([0, 4])}, b"\0" * 4 + b"hidden"))
+
+    report = scan_model(model)
+
+    assert "safetensors_trailing_data" in [item["code"] for item in report["findings"]]
+    assert report["status"] == "review"
+
+
+def test_safetensors_offsets_past_the_end_are_reported(tmp_path):
+    model = tmp_path / "truncated.safetensors"
+    model.write_bytes(_safetensors_bytes({"a": _tensor([0, 64])}, b"\0" * 4))
+
+    report = scan_model(model)
+
+    assert "safetensors_offsets_out_of_range" in [item["code"] for item in report["findings"]]
+
+
+def test_safetensors_overlapping_tensors_are_reported(tmp_path):
+    model = tmp_path / "overlap.safetensors"
+    header = {"a": _tensor([4, 12]), "b": _tensor([0, 8])}
+    model.write_bytes(_safetensors_bytes(header, b"\0" * 12))
+
+    report = scan_model(model)
+
+    assert "safetensors_overlapping_tensors" in [item["code"] for item in report["findings"]]
+
+
+def test_safetensors_entry_without_offsets_is_reported(tmp_path):
+    model = tmp_path / "broken.safetensors"
+    model.write_bytes(_safetensors_bytes({"a": {"dtype": "F32", "shape": [1]}}, b"\0" * 4))
+
+    report = scan_model(model)
+
+    codes = [(item["code"], item.get("evidence")) for item in report["findings"]]
+    assert ("safetensors_invalid_tensor_range", "a") in codes
+
+
+def test_safetensors_metadata_entry_is_not_treated_as_a_tensor(tmp_path):
+    model = tmp_path / "metadata.safetensors"
+    header = {"__metadata__": {"format": "pt"}, "a": _tensor([0, 4])}
+    model.write_bytes(_safetensors_bytes(header, b"\0" * 4))
+
+    report = scan_model(model)
+
+    assert report["status"] == "clean"
+    assert report["findings"] == []
