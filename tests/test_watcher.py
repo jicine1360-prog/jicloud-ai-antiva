@@ -38,7 +38,13 @@ def test_watcher_quarantines_blocked_model(tmp_path):
     assert not model.exists()
     quarantined = Path(results[0].quarantined_to)
     assert quarantined.exists()
-    assert quarantined.stat().st_mode & 0o777 == 0o600
+    if sys.platform == "win32":
+        # os.chmod on Windows only toggles the read-only flag, so the mode
+        # assertion is Linux-specific.  The portable enforcement here is the
+        # atomic move out of the watched directory.
+        assert quarantined.read_bytes()
+    else:
+        assert quarantined.stat().st_mode & 0o777 == 0o600
 
 
 def test_watcher_records_quarantine_failure_when_file_changes(tmp_path, monkeypatch):
