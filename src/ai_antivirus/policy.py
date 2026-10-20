@@ -83,6 +83,15 @@ def _integer_field(event: dict, name: str, default: int = 0, minimum: int = 0) -
     return value
 
 
+def _add_attribution(event: dict, normalized: dict) -> None:
+    """Carry optional process attribution so audit records stay attributable."""
+
+    if "pid" in event:
+        normalized["pid"] = _integer_field(event, "pid", minimum=1)
+    if "process_name" in event:
+        normalized["process_name"] = _text_field(event, "process_name", maximum=255)
+
+
 def normalize_event(event: dict) -> dict:
     """Return the small, bounded event schema accepted by the local API."""
 
@@ -104,6 +113,8 @@ def normalize_event(event: dict) -> dict:
         normalized["process_name"] = _text_field(event, "process_name", required=True, maximum=255)
     elif event_type != "model_output":
         raise ValueError("unsupported event_type")
+    if event_type != "process_start":
+        _add_attribution(event, normalized)
     if "data" in event:
         normalized["data"] = _text_field(event, "data", maximum=MAX_EVENT_TEXT_CHARS)
     return normalized
