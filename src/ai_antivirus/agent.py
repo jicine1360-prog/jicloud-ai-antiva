@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hmac
 import json
 import sys
 from threading import Lock
+from urllib.parse import urlsplit
 
 from .audit import AuditLog
 from .intel import ThreatFeed
@@ -15,6 +17,28 @@ from .watcher import ModelWatcher, WatchResult
 
 
 MAX_EVENT_BYTES = 1024 * 1024
+MAX_RECORDED_REJECTIONS = 100
+LOCAL_HOST_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _host_is_local(host_header: str) -> bool:
+    """Accept only loopback Host headers, which blocks DNS rebinding attacks."""
+
+    host = (host_header or "").strip().lower()
+    if not host:
+        return False
+    if host.startswith("["):
+        return host.split("]")[0][1:] in LOCAL_HOST_NAMES
+    name, separator, _ = host.rpartition(":")
+    if separator and name:
+        host = name
+    return host in LOCAL_HOST_NAMES
+
+
+def _origin_is_local(origin: str) -> bool:
+    """Accept only browser origins that are themselves loopback."""
+
+    return (urlsplit(origin).hostname or "").lower() in LOCAL_HOST_NAMES
 
 
 def _audit_event(event: dict) -> dict:
@@ -36,6 +60,29 @@ class GuardState:
         self.models_scanned = 0
         self.models_quarantined = 0
         self.last_model_scan: dict | None = None
+        self.rejections = 0
+        # Truthful component health: this build observes and records, it does
+        # not enforce network or process policy, and the status output says so.
+        self.health = {
+            "enforcement_mode": "none",
+            "enforcement_health": "unavailable",
+            "file_watcher": "disabled",
+            "runtime_monitor": "disabled",
+            "threat_feed": "disabled",
+            "auth": "disabled",
+        }
+
+    def record_rejection(self, code: str) -> None:
+        """Count a rejected request and keep bounded audit evidence of it."""
+
+        with self.lock:
+            self.rejections += 1
+            observed = self.rejections
+        if observed <= MAX_RECORDED_REJECTIONS:
+            self.audit.append(
+                {"event_type": "api_rejection", "code": code},
+                {"status": "rejected", "risk_score": 0, "findings": [code]},
+            )
 
     def inspect(self, event: dict) -> dict:
         event = normalize_event(event)
@@ -83,12 +130,14 @@ class GuardState:
             return {
                 "events_seen": self.events_seen,
                 "events_blocked": self.events_blocked,
+                "rejections": self.rejections,
                 "audit_integrity": self.audit.verify(),
                 "audit_degraded": self.audit.degraded,
                 "last_decision": self.last_decision,
                 "models_scanned": self.models_scanned,
                 "models_quarantined": self.models_quarantined,
                 "last_model_scan": self.last_model_scan,
+                **self.health,
             }
 
 
@@ -103,15 +152,50 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _reject(self, status: int, code: str) -> None:
+        self.server.state.record_rejection(code)
+        self._send(status, {"error": code})
+
+    def _authorized(self) -> bool:
+        token = self.server.auth_token
+        if token is None:
+            return True
+        supplied = self.headers.get("Authorization", "")
+        return hmac.compare_digest(supplied, f"Bearer {token}")
+
+    def _request_is_addressed_to_us(self) -> bool:
+        if not _host_is_local(self.headers.get("Host", "")):
+            self._reject(400, "invalid_host")
+            return False
+        origin = self.headers.get("Origin")
+        if origin and not _origin_is_local(origin):
+            self._reject(403, "forbidden_origin")
+            return False
+        return True
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self._request_is_addressed_to_us():
+            return
         if self.path == "/health":
             self._send(200, {"status": "ok"})
         elif self.path == "/v1/status":
+            if not self._authorized():
+                self._reject(401, "unauthorized")
+                return
             self._send(200, self.server.state.status())
         else:
             self._send(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._request_is_addressed_to_us():
+            return
+        if not self._authorized():
+            self._reject(401, "unauthorized")
+            return
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            self._reject(415, "unsupported_media_type")
+            return
         if self.path != "/v1/events":
             self._send(404, {"error": "not_found"})
             return
@@ -138,9 +222,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class GuardServer(ThreadingHTTPServer):
-    def __init__(self, port: int, state: GuardState):
+    def __init__(self, port: int, state: GuardState, auth_token: str | None = None):
         super().__init__(("127.0.0.1", port), _Handler)
         self.state = state
+        self.auth_token = auth_token
+        if auth_token:
+            state.health["auth"] = "bearer_token"
         self.daemon_threads = True
 
 
@@ -155,10 +242,11 @@ def serve(
     runtime_interval: float = 5.0,
     runtime_process_names: tuple[str, ...] = (),
     threat_feed_path: str | None = None,
+    auth_token: str | None = None,
 ) -> None:
     threat_feed = ThreatFeed(threat_feed_path) if threat_feed_path else None
     state = GuardState(policy, AuditLog(audit_path))
-    server = GuardServer(port, state)
+    server = GuardServer(port, state, auth_token)
     watcher = (
         ModelWatcher(
             watch_paths,
@@ -181,7 +269,21 @@ def serve(
         if watch_runtime
         else None
     )
-    print(f"JICloud AI Antiva listening on http://127.0.0.1:{server.server_port}")
+    if watcher:
+        state.health["file_watcher"] = "active"
+    if runtime_monitor:
+        state.health["runtime_monitor"] = "active"
+    if threat_feed is not None:
+        state.health["threat_feed"] = {
+            "loaded": True,
+            "indicators": len(threat_feed.indicators),
+            "skipped": threat_feed.skipped,
+            "path": str(threat_feed.path),
+        }
+    print(f"JICloud AI Antiva listening on http://127.0.0.1:{server.server_port}", flush=True)
+    if auth_token:
+        print("Requests to /v1/* require an Authorization: Bearer token.", flush=True)
+    print("This build records decisions; it does not block network traffic or processes.", flush=True)
     if watcher:
         watcher.start()
     if runtime_monitor:

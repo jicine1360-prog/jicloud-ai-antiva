@@ -51,6 +51,12 @@ Each build only works for its named platform; consume the artifact under the mat
 5. Add platform integration tests, adversarial artifact fixtures, and an
    independent security review before public distribution.
 
+Gate 3 is partially implemented: the local API accepts an optional bearer token
+(`--auth-token` or `AI_ANTIVA_AUTH_TOKEN`) and rejects non-loopback `Host` and
+`Origin` headers, event payloads are size-bounded, and `/v1/status` reports
+truthful component health. Bounded audit retention and externally anchored or
+signed audit checkpoints are still missing.
+
 ## Next Development Phase
 
 The next engineering target is a Linux enforcement design, not an immediate

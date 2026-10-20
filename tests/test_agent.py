@@ -2,14 +2,46 @@ import json
 from pathlib import Path
 import sys
 from threading import Thread
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from ai_antivirus.agent import GuardServer, GuardState
+from ai_antivirus.agent import (
+    MAX_EVENT_BYTES,
+    GuardServer,
+    GuardState,
+    _host_is_local,
+    _origin_is_local,
+)
 from ai_antivirus.audit import AuditLog
 from ai_antivirus.policy import Policy
 from ai_antivirus.watcher import WatchResult
+
+
+def _running_server(state: GuardState, auth_token: str | None = None) -> GuardServer:
+    server = GuardServer(0, state, auth_token)
+    Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _http(
+    server: GuardServer,
+    path: str,
+    body: str | None = None,
+    headers: dict | None = None,
+) -> tuple[int, dict]:
+    request = Request(
+        f"http://127.0.0.1:{server.server_port}{path}",
+        data=body.encode("utf-8") if body is not None else None,
+        headers=headers or {},
+        method="POST" if body is not None else "GET",
+    )
+    try:
+        with urlopen(request, timeout=3) as response:
+            return response.status, json.loads(response.read())
+    except HTTPError as error:
+        return error.code, json.loads(error.read())
 
 
 def test_sensitive_egress_is_blocked(tmp_path):
@@ -103,3 +135,128 @@ def test_loopback_api_rejects_invalid_event_types(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_host_and_origin_checks():
+    assert _host_is_local("127.0.0.1:8765")
+    assert _host_is_local("localhost:8765")
+    assert _host_is_local("[::1]:8765")
+    assert not _host_is_local("evil.example")
+    assert not _host_is_local("127.0.0.1.evil.example")
+    assert not _host_is_local("")
+
+    assert _origin_is_local("http://localhost:8765")
+    assert _origin_is_local("http://127.0.0.1:8765")
+    assert not _origin_is_local("http://evil.example")
+    assert not _origin_is_local("http://127.0.0.1.evil.example")
+
+
+def test_api_rejects_a_foreign_host_header(tmp_path):
+    state = GuardState(Policy(), AuditLog(tmp_path / "audit.jsonl"))
+    server = _running_server(state)
+    try:
+        status, body = _http(
+            server,
+            "/v1/events",
+            json.dumps({"event_type": "model_output", "data": "hello"}),
+            {"Content-Type": "application/json", "Host": "evil.example"},
+        )
+
+        assert (status, body["error"]) == (400, "invalid_host")
+        assert state.rejections == 1
+        assert state.events_seen == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_api_rejects_a_cross_origin_post(tmp_path):
+    state = GuardState(Policy(), AuditLog(tmp_path / "audit.jsonl"))
+    server = _running_server(state)
+    try:
+        status, body = _http(
+            server,
+            "/v1/events",
+            json.dumps({"event_type": "model_output", "data": "hello"}),
+            {"Content-Type": "application/json", "Origin": "http://evil.example"},
+        )
+
+        assert (status, body["error"]) == (403, "forbidden_origin")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_api_requires_a_json_content_type(tmp_path):
+    state = GuardState(Policy(), AuditLog(tmp_path / "audit.jsonl"))
+    server = _running_server(state)
+    try:
+        status, body = _http(
+            server,
+            "/v1/events",
+            json.dumps({"event_type": "model_output"}),
+            {"Content-Type": "text/plain"},
+        )
+
+        assert (status, body["error"]) == (415, "unsupported_media_type")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_api_rejects_an_oversized_request_body(tmp_path):
+    state = GuardState(Policy(), AuditLog(tmp_path / "audit.jsonl"))
+    server = _running_server(state)
+    try:
+        status, body = _http(
+            server,
+            "/v1/events",
+            json.dumps({"event_type": "model_output", "data": "a" * (MAX_EVENT_BYTES + 1)}),
+            {"Content-Type": "application/json"},
+        )
+
+        assert (status, body["error"]) == (400, "invalid_event")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_api_requires_the_bearer_token_when_configured(tmp_path):
+    token = "test-token-value-1234"
+    state = GuardState(Policy(), AuditLog(tmp_path / "audit.jsonl"))
+    server = _running_server(state, auth_token=token)
+    try:
+        status, body = _http(server, "/v1/status")
+        assert (status, body["error"]) == (401, "unauthorized")
+
+        status, body = _http(server, "/v1/status", None, {"Authorization": f"Bearer {token}"})
+        assert status == 200
+        assert body["auth"] == "bearer_token"
+
+        status, body = _http(server, "/health")
+        assert (status, body["status"]) == (200, "ok")
+
+        status, body = _http(
+            server,
+            "/v1/events",
+            json.dumps({"event_type": "model_output", "data": "hello"}),
+            {"Content-Type": "application/json"},
+        )
+        assert (status, body["error"]) == (401, "unauthorized")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_status_reports_enforcement_mode_and_component_health(tmp_path):
+    state = GuardState(Policy(), AuditLog(tmp_path / "audit.jsonl"))
+
+    status = state.status()
+
+    assert status["enforcement_mode"] == "none"
+    assert status["enforcement_health"] == "unavailable"
+    assert status["file_watcher"] == "disabled"
+    assert status["runtime_monitor"] == "disabled"
+    assert status["threat_feed"] == "disabled"
+    assert status["auth"] == "disabled"
+    assert status["rejections"] == 0

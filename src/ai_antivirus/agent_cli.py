@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from .agent import serve
@@ -48,7 +49,15 @@ def main(argv: list[str] | None = None) -> int:
         "--threat-feed",
         help="JSONL or JSON file of blocked SHA-256 indicators for watched models",
     )
+    parser.add_argument(
+        "--auth-token",
+        help="require Authorization: Bearer <token> on /v1 routes; AI_ANTIVA_AUTH_TOKEN is used when omitted",
+    )
     args = parser.parse_args(argv)
+
+    auth_token = args.auth_token or os.environ.get("AI_ANTIVA_AUTH_TOKEN") or None
+    if auth_token is not None and len(auth_token) < 16:
+        parser.error("auth token must be at least 16 characters")
 
     policy = Policy(
         allowed_hosts=frozenset(host.lower().rstrip(".") for host in args.allowed_host),
@@ -67,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
             args.runtime_interval,
             tuple(args.watch_process),
             args.threat_feed,
+            auth_token,
         )
     except ValueError as error:
         parser.error(str(error))

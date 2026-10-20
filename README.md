@@ -121,6 +121,34 @@ files with:
 .\scripts\uninstall-windows.ps1
 ```
 
+## Local guard API
+
+The guard listens on `127.0.0.1` only and answers three routes:
+
+| Route | Method | Notes |
+| --- | --- | --- |
+| `/health` | GET | liveness check; never requires a token |
+| `/v1/status` | GET | counters, component health, and audit chain state |
+| `/v1/events` | POST | one JSON event, `Content-Type: application/json`, at most 1 MiB |
+
+Requests must carry a loopback `Host` header, and a browser `Origin` header is
+accepted only when it is also loopback, so a page on another site cannot drive
+the API. Rejected requests are counted in `rejections` and recorded in the audit
+log.
+
+To require a bearer token on the `/v1` routes:
+
+```bash
+ai-model-guard --auth-token "$(openssl rand -hex 24)"
+```
+
+`AI_ANTIVA_AUTH_TOKEN` is used when the flag is omitted. Send the token as
+`Authorization: Bearer <token>`.
+
+`/v1/status` reports `enforcement_mode: "none"` and
+`enforcement_health: "unavailable"` on purpose: this build records decisions and
+quarantines files, it does not block network traffic or processes.
+
 ## Egress policy simulator
 
 Stage A includes a side-effect-free policy simulator. It validates an explicit
