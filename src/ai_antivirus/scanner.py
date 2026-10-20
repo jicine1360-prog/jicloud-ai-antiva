@@ -33,6 +33,10 @@ MAX_ARCHIVE_MEMBER_FINDINGS = 50
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024**3
 MIN_ARCHIVE_BOMB_BYTES = 100 * 1024**2
 ARCHIVE_COMPRESSION_RATIO = 100
+PICKLE_MAX_PROTOCOL = 5
+TORCH_ARCHIVE_PICKLE = "data.pkl"
+ONNX_IR_VERSION_TAG = 0x08
+ONNX_NEXT_FIELD_TAGS = {0x12, 0x1A, 0x22, 0x2A, 0x32}
 
 
 @dataclass(frozen=True)
@@ -117,6 +121,16 @@ def _archive_member_findings(member: zipfile.ZipInfo) -> list[Finding]:
     """Report the per-member risks of one archive entry, without extracting it."""
 
     findings: list[Finding] = []
+    normalized_member = member.filename.replace("\\", "/")
+    if normalized_member == TORCH_ARCHIVE_PICKLE or normalized_member.endswith(f"/{TORCH_ARCHIVE_PICKLE}"):
+        findings.append(
+            Finding(
+                "medium",
+                "archive_unsafe_member",
+                "Archive holds a pickle stream (torch checkpoint); loading it can execute arbitrary code.",
+                member.filename,
+            )
+        )
     if _unsafe_archive_path(member.filename):
         findings.append(
             Finding(
@@ -247,9 +261,76 @@ def _inspect_safetensors(path: Path, findings: list[Finding]) -> None:
         findings.append(Finding("medium", "invalid_safetensors_header", "SafeTensors header is not an object."))
 
 
+def _pickle_protocol(path: Path) -> int | None:
+    """Return the pickle protocol version when the file starts with a framing opcode.
+
+    Torch and TensorFlow checkpoints are pickle streams, and loading one runs
+    arbitrary code.  Detecting the framing is a much stronger signal than the
+    file extension alone.
+    """
+
+    try:
+        with path.open("rb") as stream:
+            head = stream.read(2)
+    except OSError:
+        return None
+    if head[:1] != b"\x80":
+        return None
+    version = head[1]
+    return version if version <= PICKLE_MAX_PROTOCOL else None
+
+
+def _read_varint(data: bytes, cursor: int) -> tuple[int | None, int]:
+    value = 0
+    shift = 0
+    while cursor < len(data):
+        byte = data[cursor]
+        value |= (byte & 0x7F) << shift
+        cursor += 1
+        if not byte & 0x80:
+            return value, cursor
+        shift += 7
+        if shift > 63:
+            return None, cursor
+    return None, cursor
+
+
+def _inspect_onnx(path: Path, findings: list[Finding]) -> None:
+    """Check the leading ModelProto fields without a protobuf dependency.
+
+    Only the preamble is validated: field 1 must be a varint ``ir_version``
+    followed by a plausible field tag.  Graph contents are not interpreted.
+    """
+
+    with path.open("rb") as stream:
+        head = stream.read(64)
+    if not head or head[0] != ONNX_IR_VERSION_TAG:
+        findings.append(
+            Finding(
+                "medium",
+                "invalid_onnx_header",
+                "ONNX ModelProto does not start with the ir_version field.",
+            )
+        )
+        return
+    ir_version, cursor = _read_varint(head, 1)
+    if ir_version is None or ir_version < 1 or cursor >= len(head) or head[cursor] not in ONNX_NEXT_FIELD_TAGS:
+        findings.append(
+            Finding(
+                "medium",
+                "invalid_onnx_header",
+                "ONNX ModelProto preamble is malformed.",
+                f"ir_version={ir_version}" if ir_version is not None else "unreadable ir_version",
+            )
+        )
+
+
 def _inspect_known_format(path: Path, suffix: str, findings: list[Finding]) -> None:
     if suffix == ".safetensors":
         _inspect_safetensors(path, findings)
+        return
+    if suffix == ".onnx":
+        _inspect_onnx(path, findings)
         return
     with path.open("rb") as stream:
         prefix = stream.read(8)
@@ -257,10 +338,6 @@ def _inspect_known_format(path: Path, suffix: str, findings: list[Finding]) -> N
         findings.append(Finding("medium", "invalid_gguf_header", "GGUF magic or version header is invalid."))
     elif suffix == ".tflite" and prefix[4:8] != b"TFL3":
         findings.append(Finding("medium", "invalid_tflite_header", "TFLite file identifier is invalid."))
-    elif suffix == ".onnx":
-        findings.append(
-            Finding("low", "format_not_validated", "ONNX structure validation is not available in this build.")
-        )
 
 
 def scan_model(path_value: str | Path, threat_feed: ThreatFeed | None = None) -> dict:
@@ -275,8 +352,9 @@ def scan_model(path_value: str | Path, threat_feed: ThreatFeed | None = None) ->
     findings: list[Finding] = []
     suffix = path.suffix.lower()
     detected_format = _format_for(path)
+    is_archive = _is_archive(path)
 
-    if suffix not in SUPPORTED_EXTENSIONS:
+    if suffix not in SUPPORTED_EXTENSIONS and suffix not in UNSAFE_SERIALIZATION_EXTENSIONS:
         findings.append(
             Finding(
                 "low",
@@ -286,17 +364,27 @@ def scan_model(path_value: str | Path, threat_feed: ThreatFeed | None = None) ->
             )
         )
 
-    if suffix in UNSAFE_SERIALIZATION_EXTENSIONS:
-        findings.append(
-            Finding(
-                "medium",
-                "unsafe_serialization_format",
-                "Format may require deserialization; use a restricted loader and sandbox.",
-                suffix,
+    if suffix in UNSAFE_SERIALIZATION_EXTENSIONS and not is_archive:
+        protocol = _pickle_protocol(path)
+        if protocol is None:
+            findings.append(
+                Finding(
+                    "medium",
+                    "unsafe_serialization_format",
+                    "Format may require deserialization; use a restricted loader and sandbox.",
+                    suffix,
+                )
             )
-        )
+        else:
+            findings.append(
+                Finding(
+                    "medium",
+                    "pickle_framed_artifact",
+                    "Artifact is a pickle stream; loading it can execute arbitrary code.",
+                    f"pickle protocol {protocol}",
+                )
+            )
 
-    is_archive = _is_archive(path)
     if suffix == ".zip" and not is_archive:
         findings.append(Finding("high", "invalid_archive", "File has an invalid ZIP structure."))
     elif is_archive:

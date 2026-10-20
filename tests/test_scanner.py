@@ -232,3 +232,63 @@ def test_archive_member_findings_are_capped(tmp_path):
     assert codes.count("archive_path_traversal") == MAX_ARCHIVE_MEMBER_FINDINGS
     assert "archive_finding_limit" in codes
     assert report["status"] == "blocked"
+
+
+def test_pickle_framed_checkpoint_is_reported_precisely(tmp_path):
+    # Signature copied from a live 4x-UltraSharp.pth checkpoint.
+    model = tmp_path / "upscaler.pth"
+    model.write_bytes(b"\x80\x02\x8a\nl\xfc\x9cF\xf9 j\xa8P\x19.\x80\x02M\xe9\x03." + b"\0" * 64)
+
+    report = scan_model(model)
+
+    codes = [item["code"] for item in report["findings"]]
+    assert "pickle_framed_artifact" in codes
+    assert "unsafe_serialization_format" not in codes
+    assert "unknown_format" not in codes
+    assert report["status"] == "review"
+
+
+def test_raw_tensor_blob_without_pickle_framing_keeps_the_extension_signal(tmp_path):
+    model = tmp_path / "dense.bin"
+    model.write_bytes(b"\xfc\x15\x81\x0f\x04\xf7\x05\n" + b"\0" * 64)
+
+    report = scan_model(model)
+
+    codes = [item["code"] for item in report["findings"]]
+    assert codes == ["unsafe_serialization_format"]
+
+
+def test_torch_zip_archive_reports_its_pickle_member(tmp_path):
+    model = tmp_path / "checkpoint.pt"
+    with zipfile.ZipFile(model, "w") as archive:
+        archive.writestr("checkpoint/version", "3")
+        archive.writestr("checkpoint/data.pkl", b"\x80\x02}q\x00.")
+        archive.writestr("checkpoint/data/0", b"\0" * 32)
+
+    report = scan_model(model)
+
+    assert "archive_unsafe_member" in [item["code"] for item in report["findings"]]
+    assert report["status"] == "review"
+
+
+def test_valid_onnx_preamble_is_accepted(tmp_path):
+    # Preamble copied from a live pytorch-exported sound_model.onnx.
+    model = tmp_path / "sound_model.onnx"
+    model.write_bytes(b"\x08\n\x12\x07pytorch\x1a\n2.14.0+cpu:" + b"\0" * 32)
+
+    report = scan_model(model)
+
+    codes = [item["code"] for item in report["findings"]]
+    assert "invalid_onnx_header" not in codes
+    assert "format_not_validated" not in codes
+    assert report["status"] == "clean"
+
+
+def test_onnx_with_a_bad_preamble_is_flagged(tmp_path):
+    model = tmp_path / "fake.onnx"
+    model.write_bytes(b"this is not a ModelProto" + b"\0" * 32)
+
+    report = scan_model(model)
+
+    assert "invalid_onnx_header" in [item["code"] for item in report["findings"]]
+    assert report["status"] == "review"
