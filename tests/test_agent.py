@@ -278,6 +278,7 @@ def test_sigterm_still_writes_the_audit_checkpoint(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
     )
     try:
         listening = process.stdout.readline()
@@ -292,9 +293,9 @@ def test_sigterm_still_writes_the_audit_checkpoint(tmp_path):
             pass
 
         if sys.platform == "win32":
-            # Windows console processes do not receive SIGTERM; terminate()
-            # still exits through the cleanup path with the checkpoint.
-            process.terminate()
+            # Windows console processes do not receive SIGTERM; CTRL_BREAK_EVENT
+            # reaches the child's SIGBREAK handler for an orderly shutdown.
+            process.send_signal(signal.CTRL_BREAK_EVENT)
         else:
             process.send_signal(signal.SIGTERM)
         process.wait(timeout=10)
@@ -350,6 +351,7 @@ def test_cli_flags_rotate_and_bound_the_audit_log(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
     )
     try:
         listening = process.stdout.readline()
@@ -367,9 +369,9 @@ def test_cli_flags_rotate_and_bound_the_audit_log(tmp_path):
                 pass
 
         if sys.platform == "win32":
-            # Windows console processes do not receive SIGTERM; terminate()
-            # still exits through the cleanup path with the checkpoint.
-            process.terminate()
+            # Windows console processes do not receive SIGTERM; CTRL_BREAK_EVENT
+            # reaches the child's SIGBREAK handler for an orderly shutdown.
+            process.send_signal(signal.CTRL_BREAK_EVENT)
         else:
             process.send_signal(signal.SIGTERM)
         process.wait(timeout=10)

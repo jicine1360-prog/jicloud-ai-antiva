@@ -319,9 +319,13 @@ def serve(
     # systemd and `kill` send SIGTERM, whose default action skips the cleanup
     # below.  Translate it into an orderly shutdown so the audit checkpoint and
     # the watcher stop still run.
-    previous_handler = None
+    previous_handlers = {}
     try:
-        previous_handler = signal.signal(signal.SIGTERM, _stop_gracefully)
+        previous_handlers[signal.SIGTERM] = signal.signal(signal.SIGTERM, _stop_gracefully)
+        if sys.platform == "win32":
+            # Windows console processes never receive SIGTERM; a graceful
+            # shutdown there arrives as CTRL_BREAK_EVENT (SIGBREAK).
+            previous_handlers[signal.SIGBREAK] = signal.signal(signal.SIGBREAK, _stop_gracefully)
     except ValueError:
         pass  # not the main thread: leave signal handling to the embedder
     try:
@@ -329,9 +333,9 @@ def serve(
     except (KeyboardInterrupt, _ShutdownRequested):
         pass
     finally:
-        if previous_handler is not None:
+        for sig, handler in previous_handlers.items():
             try:
-                signal.signal(signal.SIGTERM, previous_handler)
+                signal.signal(sig, handler)
             except (ValueError, OSError):
                 pass
         if watcher:
