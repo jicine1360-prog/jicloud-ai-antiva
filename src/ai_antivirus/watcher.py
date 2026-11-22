@@ -123,7 +123,12 @@ class ModelWatcher:
         # A quarantined artifact must not retain an executable mode.  This is
         # defense in depth: the scanner never executes artifacts, but other
         # local tools may still see the quarantine directory.
-        os.chmod(path, 0o600, follow_symlinks=False)
+        # follow_symlinks=False is unsupported on Windows (symlinks there are
+        # always followed); the path was already verified not to be a symlink.
+        try:
+            os.chmod(path, 0o600, follow_symlinks=False)
+        except NotImplementedError:
+            os.chmod(path, 0o600)
         os.replace(path, destination)
         return str(destination)
 

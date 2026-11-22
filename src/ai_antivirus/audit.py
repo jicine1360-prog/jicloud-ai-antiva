@@ -140,7 +140,7 @@ class AuditLog:
         last_seq = 0
         offset = 0
         try:
-            with self.path.open("r", encoding="utf-8") as stream:
+            with self.path.open("r", encoding="utf-8", newline="") as stream:
                 for line in stream:
                     offset += len(line.encode("utf-8"))
                     if not line.strip():
@@ -402,7 +402,9 @@ class AuditLog:
         }
         entry["entry_hash"] = hashlib.sha256(_canonical(entry)).hexdigest()
         line = json.dumps(entry, sort_keys=True) + "\n"
-        with self.path.open("a", encoding="utf-8") as stream:
+        # newline="\n": keep LF on Windows too, so byte offsets and the tail
+        # digest stay identical across platforms.
+        with self.path.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(line)
             stream.flush()
             os.fsync(stream.fileno())
@@ -429,7 +431,7 @@ class AuditLog:
         offset = 0
         verified_seq = previous_seq
         try:
-            with self.path.open("r", encoding="utf-8") as stream:
+            with self.path.open("r", encoding="utf-8", newline="") as stream:
                 for line in stream:
                     offset += len(line.encode("utf-8"))
                     if offset <= start_offset:

@@ -69,6 +69,9 @@ def test_audit_log_detects_tampering(tmp_path):
     audit.append({"event_type": "model_output"}, {"status": "allowed", "risk_score": 0, "findings": []})
     assert audit.verify()
 
+    import time
+
+    time.sleep(1.1)  # coarse Windows mtime needs a beat to become observable
     path.write_text(path.read_text(encoding="utf-8").replace("allowed", "blocked"), encoding="utf-8")
     assert not audit.verify()
 
@@ -288,7 +291,12 @@ def test_sigterm_still_writes_the_audit_checkpoint(tmp_path):
         with urlopen(request, timeout=5):
             pass
 
-        process.send_signal(signal.SIGTERM)
+        if sys.platform == "win32":
+            # Windows console processes do not receive SIGTERM; terminate()
+            # still exits through the cleanup path with the checkpoint.
+            process.terminate()
+        else:
+            process.send_signal(signal.SIGTERM)
         process.wait(timeout=10)
     finally:
         if process.poll() is None:
@@ -358,7 +366,12 @@ def test_cli_flags_rotate_and_bound_the_audit_log(tmp_path):
             with urlopen(request, timeout=5):
                 pass
 
-        process.send_signal(signal.SIGTERM)
+        if sys.platform == "win32":
+            # Windows console processes do not receive SIGTERM; terminate()
+            # still exits through the cleanup path with the checkpoint.
+            process.terminate()
+        else:
+            process.send_signal(signal.SIGTERM)
         process.wait(timeout=10)
     finally:
         if process.poll() is None:

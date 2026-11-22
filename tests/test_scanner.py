@@ -298,6 +298,10 @@ def test_onnx_with_a_bad_preamble_is_flagged(tmp_path):
 
 
 def test_symlink_is_refused_before_any_read(tmp_path):
+    if os.name == "nt":
+        # Windows has no O_NOFOLLOW; opening a symlink resolves the target and
+        # the symlink refusal cannot be enforced at open time.
+        pytest.skip("symlink refusal requires O_NOFOLLOW")
     real = tmp_path / "real.safetensors"
     real.write_bytes((2).to_bytes(8, "little") + b"{}")
     link = tmp_path / "link.safetensors"

@@ -96,7 +96,8 @@ def test_runtime_monitor_survives_a_missing_proc_net_tcp(tmp_path):
     monitor.poll_once()
 
     assert monitor.polls == 1
-    assert "net/tcp" in monitor.last_error
+    # Windows renders the path with backslashes; match the file name only.
+    assert "tcp" in (monitor.last_error or "")
     assert events == []
 
 
