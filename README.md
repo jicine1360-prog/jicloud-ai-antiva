@@ -1,5 +1,10 @@
 # JICloud AI Antiva
 
+[![CI](https://github.com/jicine1360-prog/jicloud-ai-antiva/actions/workflows/build.yml/badge.svg)](https://github.com/jicine1360-prog/jicloud-ai-antiva/actions/workflows/build.yml)
+[![Release](https://github.com/jicine1360-prog/jicloud-ai-antiva/actions/workflows/release.yml/badge.svg)](https://github.com/jicine1360-prog/jicloud-ai-antiva/actions/workflows/release.yml)
+[![GitHub release](https://img.shields.io/github/v/release/jicine1360-prog/jicloud-ai-antiva?include_prereleases)](https://github.com/jicine1360-prog/jicloud-ai-antiva/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 An AI model and host security guard by JICloud.
 
 ![JICloud AI Antiva](assets/jicloud-ai-antiva-logo.svg)
