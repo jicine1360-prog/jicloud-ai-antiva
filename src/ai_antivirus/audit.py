@@ -100,6 +100,7 @@ class AuditLog:
         self._verified_hash: str | None = None
         self._verified_seq = 0
         self._verified_mtime: int | None = None
+        self._verified_tail_digest: str | None = None
         self._anchor_pending = 0
         # Chain state expected before the first entry of the live file.  After a
         # rotation that is the tail of the newest segment, not an empty chain.
@@ -335,6 +336,7 @@ class AuditLog:
         self._verified_hash = self._chain_hash
         self._verified_seq = self._chain_seq
         self._verified_mtime = None
+        self._verified_tail_digest = None
 
     def _expire_segments(self) -> None:
         """Remove the oldest segment bodies once the anchor can vouch for them.
@@ -453,11 +455,29 @@ class AuditLog:
         self._verified_offset = offset
         self._verified_hash = previous_hash
         self._verified_seq = verified_seq
-        try:
-            self._verified_mtime = self.path.stat().st_mtime_ns
-        except OSError:
-            self._verified_mtime = None
+        self._verified_mtime = None
+        self._verified_tail_digest = self._tail_digest(offset)
         return True
+
+    _TAIL_DIGEST_BYTES = 4096
+
+    def _tail_digest(self, offset: int) -> str | None:
+        """Digest the tail of the already-verified region ``[0, offset)``.
+
+        A same-length in-place edit keeps ``st_size`` and, on filesystems with
+        coarse timestamps (Windows), can keep ``st_mtime`` unchanged.  The
+        tail digest still changes, so ``verify`` can catch the edit cheaply
+        before falling back to a full chain walk.
+        """
+        try:
+            start = max(0, offset - self._TAIL_DIGEST_BYTES)
+            if offset <= start:
+                return hashlib.sha256(b"").hexdigest()
+            with self.path.open("rb") as handle:
+                handle.seek(start)
+                return hashlib.sha256(handle.read(offset - start)).hexdigest()
+        except OSError:
+            return None
 
     def verify(self, full: bool = False) -> bool:
         """Walk the hash chain of the live log.
@@ -484,6 +504,12 @@ class AuditLog:
             if stat.st_size < self._verified_offset:
                 return False
             if stat.st_size == self._verified_offset:
+                # mtime alone cannot prove immutability (coarse Windows
+                # timestamps); verify against a digest of the verified tail.
+                if self._verified_tail_digest is not None:
+                    if self._tail_digest(self._verified_offset) == self._verified_tail_digest:
+                        return True
+                    return self._walk(0, self._chain_hash, self._chain_seq)
                 if stat.st_mtime_ns == self._verified_mtime:
                     return True
                 return self._walk(0, self._chain_hash, self._chain_seq)
