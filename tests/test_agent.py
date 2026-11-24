@@ -211,6 +211,7 @@ def test_api_requires_a_json_content_type(tmp_path):
 def test_api_rejects_an_oversized_request_body(tmp_path):
     import http.client
     import socket
+    import urllib.error
 
     state = GuardState(Policy(), AuditLog(tmp_path / "audit.jsonl"))
     server = _running_server(state)
@@ -223,10 +224,16 @@ def test_api_rejects_an_oversized_request_body(tmp_path):
                 {"Content-Type": "application/json"},
             )
             assert (status, body["error"]) == (400, "invalid_event")
+        except urllib.error.URLError as exc:
+            # Linux: the server closes the oversized connection mid-flight,
+            # urllib wraps the client-side EPIPE as URLError(BrokenPipeError).
+            # Only that specific reason may pass — any other URLError (e.g.
+            # connection refused) means the guard never saw the request.
+            if not isinstance(exc.reason, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+                raise
         except (ConnectionAbortedError, ConnectionResetError, http.client.RemoteDisconnected, BrokenPipeError):
-            # When the server closes the oversized connection mid-flight,
-            # Windows surfaces WinError 10053 on the client side; the
-            # rejection still happened either way.
+            # Windows surfaces WinError 10053 as a raw abort. The rejection
+            # still happened either way.
             pass
     finally:
         server.shutdown()
